@@ -1,0 +1,9 @@
+{
+  "hasCompletedOnboarding": true,
+  "primaryApiKey": "test",
+  "permissions": {
+    "allow": [
+      "Bash(python -c ' *)"
+    ]
+  }
+}
