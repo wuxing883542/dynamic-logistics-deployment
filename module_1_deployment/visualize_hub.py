@@ -2,6 +2,7 @@ import os
 import sys
 import torch
 import random
+import pickle  # 新增：用于保存结果文件
 import numpy as np
 import warnings
 import matplotlib.pyplot as plt
@@ -122,7 +123,7 @@ def get_sinkhorn_routing(env, active_hubs, snap_demand):
         transport_cost += np.sum(hard_probs[mask, j] * C_dist[mask, j] * snap_demand[mask])
         actual_hub_loads[j] = np.sum(hard_probs[mask, j] * snap_demand[mask])
         
-        hub_idle = env.cfg.Q - actual_hub_loads[j] 
+        hub_idle = max(0, env.cfg.Q - actual_hub_loads[j]) 
         idle_penalty += hub_idle * (env.cfg.penalty_unmet * 0.005)
 
     penalty_cost = np.sum(hard_probs[:, -1] * snap_demand) * env.cfg.penalty_unmet
@@ -141,6 +142,7 @@ def get_sinkhorn_routing(env, active_hubs, snap_demand):
         print(f"   ✅ 安全：物理红线捍卫成功，溢出量为 0！")
 
     return hard_probs, op_cost, idle_penalty
+
 def evaluate_and_plot_model(model_name, model_filename, cfg, env, device):
     set_global_seed(cfg.seed)
     
@@ -202,6 +204,18 @@ def evaluate_and_plot_model(model_name, model_filename, cfg, env, device):
 
     print(f"📸 成功抓拍！在 100 步激进采样推演中，最高单步得分为 {best_step_reward:.2f}")
     print(f"✅ {model_name} 还原出的训练巅峰有效枢纽: {active_hubs}")
+
+    # ==========================================================
+    # 🌟 新增：动态将最好模型的阵型存档，供 MCLP 基准测试调用
+    # ==========================================================
+    if model_name == "Best_Model":
+        data_dir = os.path.join(project_root, 'data')
+        os.makedirs(data_dir, exist_ok=True)
+        save_path = os.path.join(data_dir, 'rl_inference_best.pkl')
+        with open(save_path, 'wb') as f:
+            pickle.dump({'best_hubs': active_hubs}, f)
+        print(f"✅ RL 最佳阵型已存档至: {save_path}，对比实验现在可以自动读取了！")
+    # ==========================================================
 
     output_dir = os.path.join(project_root, 'data', f"{model_name}_Results")
     os.makedirs(output_dir, exist_ok=True)

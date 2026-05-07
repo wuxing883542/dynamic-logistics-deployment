@@ -1,9 +1,6 @@
 {
   "hasCompletedOnboarding": true,
-  "primaryApiKey": "test",
   "permissions": {
-    "allow": [
-      "Bash(python -c ' *)"
-    ]
+    "allow": ["Bash(python -c ' *')", "Bash(git * )"]
   }
 }
