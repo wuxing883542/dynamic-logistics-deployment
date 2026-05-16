@@ -61,9 +61,12 @@ class RobustHubEnv(gym.Env):
         # ── 状态变量 ──
         self.current_scenario = None   # (T, N) 当前日场景
         self.current_t = 0             # 当前调度步 (0..T-1)
-        self.hub_locations = []        # K 个枢纽索引
+        self.hub_locations = []        # K 个枢纽索引 (列表格式用于内部逻辑)
         self.hub_capacities = np.zeros(self.K)
         self.done_site_selection = False
+        
+        # 💡 [核心修复 1]：增加严格保序的 NumPy 数组，用于传递给神经网络
+        self.chosen_hubs = np.zeros(self.K, dtype=np.int64) 
 
         # ── 动作空间 (Gym 兼容占位, 真实格式见 step 文档) ──
         self.action_space = spaces.Box(
@@ -77,6 +80,8 @@ class RobustHubEnv(gym.Env):
             'current_orders':  spaces.Box(low=0.0, high=500.0, shape=(self.N,), dtype=np.float32),
             'hub_mask':        spaces.Box(low=0.0, high=1.0, shape=(self.N,), dtype=np.float32),
             'hub_capacities':  spaces.Box(low=0.0, high=1.0, shape=(self.K,), dtype=np.float32),
+            # 💡 [核心修复 2]：在 Gym 的观测空间中合法注册 hub_locations
+            'hub_locations':   spaces.Box(low=0, high=self.N-1, shape=(self.K,), dtype=np.int64),
         })
 
     # ── Reset ──────────────────────────────────────────────
@@ -89,6 +94,10 @@ class RobustHubEnv(gym.Env):
 
         self.current_t = 0
         self.hub_locations = []
+        
+        # 💡 [核心修复 3]：每回合开始时重置保序数组
+        self.chosen_hubs = np.zeros(self.K, dtype=np.int64)
+        
         self.hub_capacities = np.full(self.K, self.cfg.Q)
         self.done_site_selection = False
 
@@ -119,6 +128,8 @@ class RobustHubEnv(gym.Env):
             'current_orders': orders,
             'hub_mask':       hub_mask,
             'hub_capacities': self.hub_capacities.copy() / max(self.cfg.Q, 1.0),
+            # 💡 [核心修复 4]：向神经网络暴露具有严格物理映射顺序的数组
+            'hub_locations':  self.chosen_hubs.copy(),
         }
 
     # ── Step ───────────────────────────────────────────────
@@ -147,6 +158,10 @@ class RobustHubEnv(gym.Env):
                 )
 
             self.hub_locations = hubs
+            
+            # 💡 [核心修复 5]：在产生动作的瞬间，永久锁定并保存其采样顺序！
+            self.chosen_hubs = np.array(hubs, dtype=np.int64)
+            
             self.done_site_selection = True
             self.current_t = 0
 
@@ -228,4 +243,3 @@ class RobustHubEnv(gym.Env):
             return np.ones(self.N, dtype=bool)
         else:
             return np.ones((self.N, self.K + 1), dtype=bool)
-

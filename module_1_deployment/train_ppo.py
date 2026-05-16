@@ -20,7 +20,7 @@ def set_global_seed(seed=42):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
     os.environ['PYTHONHASHSEED'] = str(seed)
-    print(f"Random seed locked: {seed}")
+    print(f"随机种子已锁定: {seed}")
 
 
 current_module_dir = os.path.dirname(os.path.abspath(__file__))
@@ -45,6 +45,8 @@ def obs_to_tensors(obs, device):
         'current_orders':  torch.FloatTensor(obs['current_orders']).unsqueeze(0).to(device),
         'hub_mask':        torch.FloatTensor(obs['hub_mask']).unsqueeze(0).to(device),
         'hub_capacities':  torch.FloatTensor(obs['hub_capacities']).unsqueeze(0).to(device),
+        # 💡 [空间对齐修复]：将严格保序的枢纽 ID 转换为 LongTensor 传给模型
+        'hub_locations':   torch.LongTensor(obs['hub_locations']).unsqueeze(0).to(device), 
         'lstm_hidden':     None,
     }
 
@@ -52,7 +54,7 @@ def obs_to_tensors(obs, device):
 def deterministic_eval(env, policy, device):
     obs, _ = env.reset()
     t_obs = obs_to_tensors(obs, device)
-    logits, _ = policy(t_obs)
+    logits, _ = policy(t_obs, detach_backbone=True)
     hubs, _ = policy.sample_site(logits[0], deterministic=True)
     obs, reward_site, _, _, info_site = env.step(np.array(hubs))
 
@@ -65,7 +67,7 @@ def deterministic_eval(env, policy, device):
     while not done:
         t_obs = obs_to_tensors(obs, device)
         t_obs['lstm_hidden'] = lstm_hidden
-        logits, _, lstm_hidden = policy(t_obs)
+        logits, lstm_hidden = policy(t_obs, detach_backbone=True)
         actions, _, _ = policy.sample_dispatch(logits, deterministic=True)
         obs, reward, done, _, info = env.step(actions.cpu().numpy())
         total_transport += info['transport_cost']
@@ -84,27 +86,39 @@ def deterministic_eval(env, policy, device):
     }
 
 
-# ── PPO update ─────────────────────────────────────────
+# ── PPO 更新核心逻辑 ─────────────────────────────────────────
 def ppo_update(trajectories, policy, optimizer, device,
-               gamma, gae_lambda, clip_epsilon, value_clip_epsilon,
-               ppo_epochs, target_kl, entropy_coef, writer, episode):
+               gamma, clip_epsilon, value_clip_epsilon,
+               ppo_epochs, target_kl, entropy_coef, writer, episode,
+               is_warmup): 
 
-    # Compute site-step GAE: the site step's return = discounted sum of all downstream rewards
     site_advs = []
     site_rets = []
     for traj in trajectories:
         ret = 0.0
         for s in reversed(traj):
             ret = s['reward'] + gamma * ret
-        site_val = traj[0]['value'].item()  # Critic value at site step
-        site_advs.append(ret - site_val)
-        site_rets.append(ret)
+            
+        # 💡 [抹平方差修复]：消除环境“运气方差”，计算单位需求成本 (Cost per Ton)
+        norm_ret = ret / (traj[0]['ep_demand'] / 1000.0 + 1e-8)
+        
+        site_val = traj[0]['value'].item() 
+        site_advs.append(norm_ret - site_val)
+        site_rets.append(norm_ret)
 
-    # Pre-normalize site advantages
     site_adv_t = torch.tensor(site_advs, dtype=torch.float32).to(device)
     if len(site_adv_t) > 1:
         site_adv_t = (site_adv_t - site_adv_t.mean()) / (site_adv_t.std() + 1e-8)
     site_ret_t = torch.tensor(site_rets, dtype=torch.float32).to(device)
+
+    all_disp_advs = []
+    for traj in trajectories:
+        for s in traj[1:]:
+            all_disp_advs.append(s['per_node_adv']) 
+            
+    disp_adv_t = torch.cat(all_disp_advs, dim=0) 
+    disp_adv_mean = disp_adv_t.mean()
+    disp_adv_std = disp_adv_t.std() + 1e-8
 
     for _epoch in range(ppo_epochs):
         total_site_actor = 0.0
@@ -116,9 +130,9 @@ def ppo_update(trajectories, policy, optimizer, device,
         n_disp = 0
 
         for ti, traj in enumerate(trajectories):
-            # ── Site step (GAE + Critic) ──
+            # ── 选址步 ──
             s = traj[0]
-            logits, new_value = policy(s['obs'])
+            logits, new_value = policy(s['obs'], detach_backbone=not is_warmup)
             new_lp = policy.compute_site_log_prob(logits[0], s['action'])
 
             old_lp = s['log_prob'].detach()
@@ -133,6 +147,12 @@ def ppo_update(trajectories, policy, optimizer, device,
             surr2 = torch.clamp(ratio, 1 - clip_epsilon, 1 + clip_epsilon) * adv_i
             site_actor = -torch.min(surr1, surr2)
 
+            # 💡 [增强探索修复]：为选址策略加入熵增益，避免陷入死胡同
+            from torch.distributions import Categorical
+            site_dist = Categorical(logits=logits[0])
+            site_entropy = site_dist.entropy().mean()
+            total_entropy += site_entropy * 0.1 
+
             val_clipped = s['value'] + torch.clamp(new_value - s['value'], -value_clip_epsilon, value_clip_epsilon)
             v_loss = 0.5 * torch.max((new_value - ret_i)**2, (val_clipped - ret_i)**2)
 
@@ -141,18 +161,18 @@ def ppo_update(trajectories, policy, optimizer, device,
             total_kl += kl
             n_site += 1
 
-            # ── Dispatch steps (per-node cost advantage, no Critic) ──
+            # ── 调度步 ──
             lstm_hidden = None
             for s in traj[1:]:
                 obs = s['obs']
                 obs['lstm_hidden'] = lstm_hidden
-                logits, _, lstm_hidden = policy(obs)
+                logits, lstm_hidden = policy(obs, detach_backbone=not is_warmup)
 
                 new_per_lp, _ = policy.compute_dispatch_log_prob(logits, s['action'].unsqueeze(0))
-                # new_per_lp: (N,), old_per_lp: (N,), per_node_adv: (N,)
 
                 old_per_lp = s['per_node_lp'].detach()
-                per_node_adv = s['per_node_adv']
+                
+                per_node_adv = (s['per_node_adv'] - disp_adv_mean) / disp_adv_std
 
                 log_ratio_i = new_per_lp - old_per_lp
                 ratio_i = torch.exp(log_ratio_i)
@@ -162,7 +182,6 @@ def ppo_update(trajectories, policy, optimizer, device,
                 surr2_i = torch.clamp(ratio_i, 1 - clip_epsilon, 1 + clip_epsilon) * per_node_adv
                 disp_actor = -torch.min(surr1_i, surr2_i).mean()
 
-                from torch.distributions import Categorical
                 entropy = Categorical(logits=logits).entropy().mean()
 
                 total_disp_actor += disp_actor
@@ -176,9 +195,14 @@ def ppo_update(trajectories, policy, optimizer, device,
         if avg_kl > 1.5 * target_kl:
             break
 
-        loss = (total_site_actor / max(n_site, 1) +
-                total_disp_actor / max(n_disp, 1) +
-                total_site_critic / max(n_site, 1))
+        if is_warmup:
+            loss = (total_disp_actor / max(n_disp, 1) + 
+                    total_site_critic / max(n_site, 1))
+        else:
+            loss = (total_site_actor / max(n_site, 1) +
+                    total_disp_actor / max(n_disp, 1) +
+                    total_site_critic / max(n_site, 1))
+
         loss = loss - entropy_coef * (total_entropy / max(n_disp, 1))
 
         optimizer.zero_grad()
@@ -195,12 +219,12 @@ def ppo_update(trajectories, policy, optimizer, device,
     writer.add_scalar("Stats/site_ret_mean", site_ret_t.mean().item(), episode)
 
 
-# ── Main training loop ─────────────────────────────────
+# ── 主训练循环 ─────────────────────────────────
 def train():
     cfg = UAVHubConfig()
     set_global_seed(cfg.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Training start [Option B: Site + Dispatch PPO]. Device: {device}")
+    print(f"开始训练 [方案 B: 选址 + 调度 PPO]. 计算设备: {device}")
 
     models_dir = os.path.join(current_module_dir, "models")
     logs_base_dir = os.path.join(current_module_dir, "logs")
@@ -220,12 +244,12 @@ def train():
     optimizer = Adam(policy.parameters(), lr=initial_lr)
 
     gamma = 0.99
-    gae_lambda = 0.95
     clip_epsilon = 0.2
     value_clip_epsilon = 2.0
     ppo_epochs = 4
 
-    update_timestep = 480
+    # 💡 [样本量修复]：扩大每批次更新的数据量，10天一更新，为 Advantage 标准化提供充足基数
+    update_timestep = 960 
     max_episodes = 5000
 
     best_eval_cost = float('inf')
@@ -236,9 +260,12 @@ def train():
     final_entropy_coef = 0.001
     target_kl = 0.03
 
+    warmup_episodes = 300  
     episode = 0
 
     while episode < max_episodes:
+        is_warmup = episode < warmup_episodes
+
         progress = episode / max_episodes
         anneal = max(0.0, (progress - 0.5) * 2.0)
         current_lr = initial_lr + (final_lr - initial_lr) * anneal
@@ -254,9 +281,9 @@ def train():
             obs, _ = env.reset()
             traj = []
 
-            # ── Site step ──
+            # ── 选址步 ──
             t_obs = obs_to_tensors(obs, device)
-            logits, value = policy(t_obs)
+            logits, value = policy(t_obs, detach_backbone=not is_warmup)
             hubs, site_lp = policy.sample_site(logits[0])
             next_obs, reward_site, _, _, info_site = env.step(np.array(hubs))
 
@@ -270,20 +297,20 @@ def train():
 
             ep_transport = 0.0
             ep_penalty = 0.0
+            ep_demand = 0.0 # 💡 初始化每天的累积需求总量
 
-            # ── Dispatch steps ──
+            # ── 调度步 ──
             done = False
             lstm_hidden = None
             while not done:
                 t_obs = obs_to_tensors(next_obs, device)
                 t_obs['lstm_hidden'] = lstm_hidden
 
-                logits, value, lstm_hidden = policy(t_obs)
+                logits, lstm_hidden = policy(t_obs, detach_backbone=not is_warmup)
                 actions, per_node_lp, sum_lp = policy.sample_dispatch(logits)
 
                 next_obs, reward, done, _, info = env.step(actions.cpu().numpy())
 
-                # Per-node advantage = -per_node_cost / 100 (same scale as step reward)
                 per_node_cost = torch.FloatTensor(info['per_node_cost']).to(device)
                 per_node_adv = -per_node_cost / 100.0
 
@@ -293,16 +320,19 @@ def train():
                     'log_prob':     sum_lp,
                     'per_node_lp':  per_node_lp.detach(),
                     'per_node_adv': per_node_adv,
-                    'value':        value.squeeze().detach(),
                     'reward':       reward,
                 })
 
                 ep_transport += info['transport_cost']
                 ep_penalty += info['unmet_penalty']
+                ep_demand += info['total_demand'] # 💡 累加需求
 
                 if info['t'] in [32, 72]:
-                    print(f"   [Dispatch] t={info['t']}/96 | active={info['active_orders']} | "
-                          f"served={info['served_per_hub']}")
+                    print(f"   [调度] t={info['t']}/96 | 活跃订单={info['active_orders']} | "
+                          f"已服务={info['served_per_hub']}")
+
+            # 💡 将全天总需求存入轨迹的第一步，供 Critic 在 ppo_update 中计算单位成本
+            traj[0]['ep_demand'] = ep_demand
 
             collected_steps += len(traj)
             trajectories.append(traj)
@@ -316,18 +346,18 @@ def train():
             writer.add_scalar("Train/Penalty", ep_penalty, episode)
             writer.add_scalar("Train/FixedCost", -reward_site * 100.0, episode)
 
-            print(f"[Ep {episode:04d}] hubs={hubs} | cost={ep_cost:.0f} | "
-                  f"transport={ep_transport:.0f} | penalty={ep_penalty:.0f} | cov={ep_cov*100:.1f}%")
+            status_tag = "[热身期]" if is_warmup else "[觉醒期]"
+            print(f"[Ep {episode:04d}] {status_tag} hubs={hubs} | 成本={ep_cost:.0f} | "
+                  f"运输={ep_transport:.0f} | 惩罚={ep_penalty:.0f} | 覆盖率={ep_cov*100:.1f}%")
 
-        # ── PPO update ──
         ppo_update(
             trajectories, policy, optimizer, device,
-            gamma, gae_lambda, clip_epsilon, value_clip_epsilon,
-            ppo_epochs, target_kl, entropy_coef, writer, episode
+            gamma, clip_epsilon, value_clip_epsilon,
+            ppo_epochs, target_kl, entropy_coef, writer, episode,
+            is_warmup 
         )
         writer.add_scalar("PPO/lr", current_lr, episode)
 
-        # ── Eval ──
         if episode - last_eval_episode >= eval_interval:
             last_eval_episode = episode
             eval_env = RobustHubEnv(cfg, mode='eval')
@@ -342,16 +372,16 @@ def train():
             if eval_cost < best_eval_cost and eval_cost > 0:
                 best_eval_cost = eval_cost
                 torch.save(policy.state_dict(), os.path.join(models_dir, "best_eval_policy.pth"))
-                print(f"[EVAL BEST] Ep {episode:04d} | cost={eval_cost:.0f} | "
-                      f"cov={eval_cov*100:.1f}% | hubs={eval_hubs}")
+                print(f"⭐ [评估最优] Ep {episode:04d} | 成本={eval_cost:.0f} | "
+                      f"覆盖率={eval_cov*100:.1f}% | 枢纽选址={eval_hubs}")
             else:
-                print(f"[EVAL] Ep {episode:04d} | cost={eval_cost:.0f} | "
-                      f"cov={eval_cov*100:.1f}% | hubs={eval_hubs}")
+                print(f"📊 [评估] Ep {episode:04d} | 成本={eval_cost:.0f} | "
+                      f"覆盖率={eval_cov*100:.1f}% | 枢纽选址={eval_hubs}")
 
     final_model_path = os.path.join(models_dir, "final_gat_policy.pth")
     torch.save(policy.state_dict(), final_model_path)
     writer.close()
-    print("Training complete. Model saved.")
+    print("🎉 训练完成，模型已保存！")
 
 
 if __name__ == "__main__":

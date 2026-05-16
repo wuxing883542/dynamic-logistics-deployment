@@ -87,8 +87,19 @@ def generate_and_save_data():
         for j in range(actual_N):
             C[i, j] = np.linalg.norm(coords[i] - coords[j])
             
-    f = np.full(actual_N, getattr(cfg, 'f_min', 10000.0))
-
+    # 💡 [核心修复] 引入异质性建站成本
+    f_min = getattr(cfg, 'f_min', 10000.0)
+    f_max = getattr(cfg, 'f_max', 20000.0)
+    
+    # 按照建筑高度（容积率）来计算地价归一化系数
+    height_norm = (heights - np.min(heights)) / (np.max(heights) - np.min(heights) + 1e-8)
+    
+    # 高楼（商业区）贵，矮楼（住宅区）便宜
+    f = f_min + height_norm * (f_max - f_min)
+    
+    # 加一点均匀分布的现实地价噪音 (±500)，防止被网络抓到纯线性漏洞
+    noise = np.random.uniform(-500.0, 500.0, size=actual_N)
+    f = np.clip(f + noise, f_min, f_max)
     # ==========================================
     # 🌟 5. 动态日场景生成 (修复时序残差与动态配置)
     # ==========================================
