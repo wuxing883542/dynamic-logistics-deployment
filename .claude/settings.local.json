@@ -1,6 +1,14 @@
 {
-  "hasCompletedOnboarding": true,
   "permissions": {
-    "allow": ["Bash(python -c ' *')", "Bash(git * )"]
-  }
+    "allow": [
+      "Bash(python -c ' *')",
+      "Bash(git * )",
+      "Bash(python -c ' *)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('module_1_deployment/train_ppo.py'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(tasklist)",
+      "Bash(python -u module_1_deployment/train_ppo.py)",
+      "Bash(echo \"PID: $!\")"
+    ]
+  },
+  "hasCompletedOnboarding": true
 }

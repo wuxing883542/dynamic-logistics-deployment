@@ -2,115 +2,193 @@ import torch
 import torch.nn as nn
 from torch.distributions import Categorical
 
+
 class GraphAttentionPPO(nn.Module):
+    """Option B: Site-Dispatch PPO with shared Transformer backbone.
+
+    Phase 0 (site selection): Plackett-Luce sequential sampling → K unique hubs
+    Phase 1 (dispatch): N independent Categorical(K+1) → per-node hub/reject
     """
-    基于空间偏置图注意力网络 (Spatial-Aware GAT) 的 PPO 决策大脑
-    输入: 城市节点矩阵 (N, 3) -> [x坐标, y坐标, 是否为枢纽]
-    输出: 动作概率分布 (Discrete) & 当前状态价值 (Value)
-    """
-    def __init__(self, N=20, max_hubs=5, hidden_dim=128):
-        super(GraphAttentionPPO, self).__init__()
+
+    def __init__(self, N=98, node_dim=5, hidden_dim=128, K=3):
+        super().__init__()
         self.N = N
-        self.max_hubs = max_hubs
-        self.action_dim = max_hubs * (N + 1)
-        
-        # 1. 节点特征嵌入层
-        self.node_embed = nn.Linear(3, hidden_dim)
-        
-        # 💡 [新增]: 空间图拓扑注入器 (Spatial Edge Projector)
-        # 作用: 将物理距离转化为图的“边权重惩罚”，注入到注意力机制中
-        self.num_heads = 4
-        self.spatial_bias_proj = nn.Sequential(
-            nn.Linear(1, 16),
-            nn.ReLU(),
-            nn.Linear(16, self.num_heads) # 为每个 Attention Head 学习一个独特的距离衰减策略
-        )
-        
-        # 2. 图注意力层 (将标准 Transformer 升级为 GAT)
+        self.K = K
+        self.hidden_dim = hidden_dim
+
+        # ── Shared backbone ──
+        self.node_embed = nn.Linear(node_dim + 1, hidden_dim)  # +1 for hub_mask
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=hidden_dim, 
-            nhead=self.num_heads,            
-            dim_feedforward=256,
-            batch_first=True
+            d_model=hidden_dim, nhead=4, dim_feedforward=256, batch_first=True
         )
-        self.gat_layers = nn.TransformerEncoder(encoder_layer, num_layers=2)
-        
-        # 3. PPO 决策头
-        flatten_dim = N * hidden_dim
-        
-        self.actor_net = nn.Sequential(
-            nn.Linear(flatten_dim, 256),
-            nn.ReLU(),
-            nn.Linear(256, self.action_dim)
-        )
-        
-        self.critic_net = nn.Sequential(
-            nn.Linear(flatten_dim, 256),
-            nn.ReLU(),
-            nn.Linear(256, 1)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=2)
+
+        # ── Phase 1: Site head ──
+        self.site_scorer = nn.Sequential(
+            nn.Linear(hidden_dim, 64), nn.ReLU(), nn.Linear(64, 1)
         )
 
-    def forward(self, obs):
-        batch_size = obs.shape[0]
-        
-        # ==================================================
-        # 🕸️ [阶段一：动态图结构重构 (Graph Construction)]
-        # ==================================================
-        # 1. 提取物理坐标 -> (Batch, N, 2)
-        coords = obs[:, :, :2] 
-        
-        # 2. 利用广播机制，动态计算节点间的物理距离矩阵 -> (Batch, N, N)
-        diff = coords.unsqueeze(2) - coords.unsqueeze(1) # (Batch, N, N, 2)
-        dist_matrix = torch.sqrt(torch.sum(diff**2, dim=-1) + 1e-5)          # (Batch, N, N)
-        
-        # 3. 将距离标量投影为多头注意力偏置 -> (Batch, N, N, Heads)
-        dist_features = dist_matrix.unsqueeze(-1)        # (Batch, N, N, 1)
-        spatial_bias = self.spatial_bias_proj(dist_features)
-        
-        # 4. 调整形状以匹配 PyTorch 的 src_mask 要求: (Batch * Heads, N, N)
-        spatial_bias = spatial_bias.permute(0, 3, 1, 2)  # (Batch, Heads, N, N)
+        # ── Phase 2: Dispatch head ──
+        # Policy LSTM: temporal demand tracking for dispatch decisions
+        self.policy_lstm = nn.LSTM(input_size=3, hidden_size=64, batch_first=True)
+        self.order_proj = nn.Linear(hidden_dim + 1 + 64, 64)
+        self.hub_proj = nn.Linear(hidden_dim + 1, 64)
+        self.reject_feat = nn.Parameter(torch.randn(1, 1, 64))
 
-        # 取负绝对值作为距离惩罚，clamp 到 [-5, 0] 防止数值过大导致 softmax 输出 NaN
-        spatial_mask = -torch.abs(spatial_bias)           # (Batch, Heads, N, N)
-        spatial_mask = torch.clamp(spatial_mask, min=-5.0)
-        spatial_mask = spatial_mask.reshape(batch_size * self.num_heads, self.N, self.N)
-        
-        # ==================================================
-        # 🧠 [阶段二：带有空间拓扑的消息传递 (Message Passing)]
-        # ==================================================
-        # 5. 节点嵌入 -> (Batch, N, 128)
-        x = self.node_embed(obs)
-        
-        # 6. 传入 spatial_mask！PyTorch 会将其直接加到 Attention Logits 上。
-        # 此时的 Transformer 已经变成了融合了物理距离的纯正 Graph Attention Network!
-        graph_out = self.gat_layers(x, mask=spatial_mask)
-        
-        # ==================================================
-        # 🎯 [阶段三：动作与价值输出]
-        # ==================================================
-        # 7. 展平整个城市的特征图 -> (Batch, N * 128)
-        flat_out = graph_out.reshape(batch_size, -1)
-        
-        # 8. 计算 Critic 价值与 Actor Logits
-        value = self.critic_net(flat_out)
-        logits = self.actor_net(flat_out)
-        
-        dist = Categorical(logits=logits)
-        
-        return dist, value
+        # ── Critic (site / dispatch 分离; dispatch Critic 无 LSTM，避免梯度冲突) ──
+        self.site_critic = nn.Sequential(
+            nn.Linear(hidden_dim * 2, 64), nn.ReLU(), nn.Linear(64, 1)
+        )
+        # dispatch Critic: node stats + demand stats (no LSTM — stateless, stable)
+        self.dispatch_critic = nn.Sequential(
+            nn.Linear(hidden_dim * 2 + 3, 64), nn.ReLU(), nn.Linear(64, 1)
+        )
 
-    def act(self, obs):
-        device = next(self.parameters()).device 
-        if not isinstance(obs, torch.Tensor):
-            obs = torch.FloatTensor(obs).unsqueeze(0).to(device)
-        with torch.no_grad():
-            dist, value = self(obs)
-            action = dist.sample()
-            log_prob = dist.log_prob(action)
-        return action.item(), log_prob.item(), value.item()
+    # ── Shared encoding ────────────────────────────────
+    def _encode_nodes(self, node_features, hub_mask):
+        x = torch.cat([node_features, hub_mask.unsqueeze(-1)], dim=-1)
+        x = self.node_embed(x)
+        return self.transformer(x)
 
-    def evaluate(self, obs, action):
-        dist, value = self(obs)
-        log_prob = dist.log_prob(action)
-        entropy = dist.entropy()
-        return log_prob, value.squeeze(-1), entropy
+    # ── Unified forward ────────────────────────────────
+    def forward(self, obs_batch):
+        """obs_batch keys:
+        - phase: int (0=site, 1=dispatch)
+        - node_features: (B, N, 5)
+        - hub_mask: (B, N)
+        - current_orders: (B, N)        [dispatch only]
+        - hub_capacities: (B, K)        [dispatch only]
+        - lstm_hidden: optional tuple   [dispatch only]
+        Returns:
+        - phase=0: (logits (B,N), value (B,))
+        - phase=1: (logits (B,N,K+1), value (B,), lstm_hidden)
+        """
+        node_f = obs_batch['node_features']
+        hub_m = obs_batch['hub_mask']
+        node_emb = self._encode_nodes(node_f, hub_m)
+
+        phase = obs_batch['phase']
+        if isinstance(phase, torch.Tensor):
+            phase = phase.item() if phase.numel() == 1 else phase[0].item()
+
+        if phase == 0:
+            return self._forward_site(node_emb)
+        else:
+            orders = obs_batch['current_orders']
+            hub_caps = obs_batch['hub_capacities']
+            lstm_hidden = obs_batch.get('lstm_hidden', None)
+            return self._forward_dispatch(node_emb, orders, hub_caps, hub_m, lstm_hidden)
+
+    # ── Phase 0: Site selection ────────────────────────
+    def _forward_site(self, node_emb):
+        logits = self.site_scorer(node_emb).squeeze(-1)
+        # Critic on detached emb — prevents Critic gradient from distorting shared Transformer
+        val_feat = torch.cat([node_emb.detach().mean(dim=1), node_emb.detach().max(dim=1)[0]], dim=-1)
+        value = self.site_critic(val_feat).squeeze(-1)
+        return logits, value
+
+    # ── Phase 1: Dispatch ──────────────────────────────
+    def _forward_dispatch(self, node_emb, orders, hub_caps, hub_mask, lstm_hidden):
+        B = orders.size(0)
+
+        # Policy LSTM: temporal demand stats
+        total_demand = orders.sum(dim=-1, keepdim=True)
+        demand_std = orders.std(dim=-1, keepdim=True)
+        demand_max = orders.max(dim=-1)[0].unsqueeze(-1)
+        lstm_input = torch.cat([total_demand, demand_std, demand_max], dim=-1).unsqueeze(1)
+
+        if lstm_hidden is None:
+            lstm_out, lstm_hidden = self.policy_lstm(lstm_input)
+        else:
+            lstm_out, lstm_hidden = self.policy_lstm(lstm_input, lstm_hidden)
+
+        # Order queries: node_emb + order_qty + LSTM context
+        orders_expanded = orders.unsqueeze(-1)
+        lstm_expanded = lstm_out.expand(-1, self.N, -1)
+        q = self.order_proj(torch.cat([node_emb, orders_expanded, lstm_expanded], dim=-1))
+
+        # Hub keys: extract hub node embeddings
+        hub_embs = self._extract_hub_embeddings(node_emb, hub_mask)
+        cap_expanded = hub_caps.unsqueeze(-1)
+        k_hubs = self.hub_proj(torch.cat([hub_embs, cap_expanded], dim=-1))
+
+        # Append reject key
+        k_reject = self.reject_feat.expand(B, 1, -1)
+        k_all = torch.cat([k_hubs, k_reject], dim=1)
+
+        # Cross-attention
+        logits = torch.bmm(q, k_all.transpose(1, 2)) / (64 ** 0.5)
+
+        # Dispatch Critic: detached emb + demand stats — no gradient into Transformer
+        emb_d = node_emb.detach()
+        val_feat = torch.cat([
+            emb_d.mean(dim=1), emb_d.max(dim=1)[0],
+            total_demand, demand_std, demand_max,
+        ], dim=-1)
+        value = self.dispatch_critic(val_feat).squeeze(-1)
+
+        return logits, value, lstm_hidden
+
+    def _extract_hub_embeddings(self, node_emb, hub_mask):
+        """Extract K hub embeddings from node_emb using hub_mask. Returns (B, K, H)."""
+        B = node_emb.size(0)
+        hub_mask_bool = hub_mask > 0.5
+        hub_embs = []
+        for b in range(B):
+            indices = torch.where(hub_mask_bool[b])[0]
+            hub_embs.append(node_emb[b, indices])
+        return torch.stack(hub_embs, dim=0)
+
+    # ── Sampling helpers ───────────────────────────────
+    def sample_site(self, logits, deterministic=False):
+        """Plackett-Luce sequential sampling without replacement.
+
+        Returns (indices list of K ints, log_prob scalar).
+        """
+        hubs = []
+        log_prob = 0.0
+        remaining = torch.ones(self.N, dtype=torch.bool, device=logits.device)
+
+        for _ in range(self.K):
+            masked = logits.masked_fill(~remaining, -1e9)
+            dist = Categorical(logits=masked)
+            if deterministic:
+                h = masked.argmax()
+            else:
+                h = dist.sample()
+            log_prob += dist.log_prob(h)
+            hubs.append(h.item() if h.numel() == 1 else h.cpu().item())
+            remaining[h] = False
+
+        return hubs, log_prob
+
+    def sample_dispatch(self, logits, deterministic=False):
+        """Per-node independent Categorical over K+1 options.
+
+        Returns (actions (N,), per_node_lp (N,), sum_lp scalar).
+        """
+        dist = Categorical(logits=logits.squeeze(0))
+        if deterministic:
+            actions = logits.squeeze(0).argmax(dim=-1)
+        else:
+            actions = dist.sample()
+        per_node_lp = dist.log_prob(actions)  # (N,)
+        return actions, per_node_lp, per_node_lp.sum()
+
+    def compute_site_log_prob(self, logits, hubs):
+        """Recompute Plackett-Luce log_prob for a given hub sequence."""
+        log_prob = 0.0
+        remaining = torch.ones(self.N, dtype=torch.bool, device=logits.device)
+        for h in hubs:
+            masked = logits.masked_fill(~remaining, -1e9)
+            dist = Categorical(logits=masked)
+            h_t = torch.tensor(h, device=logits.device, dtype=torch.long)
+            log_prob += dist.log_prob(h_t)
+            remaining[h] = False
+        return log_prob
+
+    def compute_dispatch_log_prob(self, logits, actions):
+        """Recompute per-node log_probs. Returns (per_node (N,), sum)."""
+        dist = Categorical(logits=logits.squeeze(0))
+        per_node = dist.log_prob(actions.squeeze(0))  # (N,)
+        return per_node, per_node.sum()

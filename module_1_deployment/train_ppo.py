@@ -3,21 +3,14 @@ if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(encoding='utf-8')
 
 import os
-import copy
 import random
 import numpy as np
 import torch
-import torch.nn.functional as F
-from torch.distributions import Categorical
 from torch.optim import Adam
 from torch.utils.tensorboard import SummaryWriter
 import datetime
 
-# ==========================================
-# 【核心防御 1：全局随机种子锁定】
-# 作用：确保强化学习的勘探轨迹和网络初始化绝对一致。
-# 答辩话术：保证课题实验结果具备严格的“可复现性 (Reproducibility)”。
-# ==========================================
+
 def set_global_seed(seed=42):
     random.seed(seed)
     np.random.seed(seed)
@@ -27,7 +20,8 @@ def set_global_seed(seed=42):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
     os.environ['PYTHONHASHSEED'] = str(seed)
-    print(f"✅ 随机种子已锁定: {seed}")
+    print(f"Random seed locked: {seed}")
+
 
 current_module_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.dirname(current_module_dir)
@@ -38,201 +32,327 @@ from config import UAVHubConfig
 from module_1_deployment.env_robust_hub import RobustHubEnv
 from module_1_deployment.model_gat_ppo import GraphAttentionPPO
 
-# ==========================================
-# 【物理硬约束：动作掩码 (Action Mask)】
-# 作用：禁止系统在同一个地理节点上叠加建设多个枢纽。
-# 凡是已被占用的节点，其动作概率被强制设为极大负数，彻底阻断非法搜索空间。
-# ==========================================
-def get_action_mask(state, max_hubs, N, device, hub_locations):
-    action_dim = max_hubs * (N + 1)
-    mask = torch.ones(action_dim, dtype=torch.bool).to(device)
-    occupied_nodes = set(np.where(state[:, 2] == 1.0)[0].tolist())
-    
-    for h_idx in range(max_hubs):
-        own_node = hub_locations[h_idx] if h_idx < len(hub_locations) else N
-        for node_idx in occupied_nodes:
-            if node_idx == own_node:
-                continue 
-            idx = h_idx * (N + 1) + node_idx
-            mask[idx] = False
-    return mask
 
+def clone_obs(obs):
+    return {k: v.clone().detach() if isinstance(v, torch.Tensor) else v
+            for k, v in obs.items() if k != 'lstm_hidden'}
+
+
+def obs_to_tensors(obs, device):
+    return {
+        'phase':           obs['phase'],
+        'node_features':   torch.FloatTensor(obs['node_features']).unsqueeze(0).to(device),
+        'current_orders':  torch.FloatTensor(obs['current_orders']).unsqueeze(0).to(device),
+        'hub_mask':        torch.FloatTensor(obs['hub_mask']).unsqueeze(0).to(device),
+        'hub_capacities':  torch.FloatTensor(obs['hub_capacities']).unsqueeze(0).to(device),
+        'lstm_hidden':     None,
+    }
+
+
+def deterministic_eval(env, policy, device):
+    obs, _ = env.reset()
+    t_obs = obs_to_tensors(obs, device)
+    logits, _ = policy(t_obs)
+    hubs, _ = policy.sample_site(logits[0], deterministic=True)
+    obs, reward_site, _, _, info_site = env.step(np.array(hubs))
+
+    total_cost = -reward_site * 100.0
+    total_transport = 0.0
+    total_penalty = 0.0
+
+    done = False
+    lstm_hidden = None
+    while not done:
+        t_obs = obs_to_tensors(obs, device)
+        t_obs['lstm_hidden'] = lstm_hidden
+        logits, _, lstm_hidden = policy(t_obs)
+        actions, _, _ = policy.sample_dispatch(logits, deterministic=True)
+        obs, reward, done, _, info = env.step(actions.cpu().numpy())
+        total_transport += info['transport_cost']
+        total_penalty += info['unmet_penalty']
+
+    total_cost += total_transport + total_penalty
+    coverage = 1.0 - total_penalty / max(total_transport + total_penalty, 1.0)
+
+    return {
+        'avg_cost':     total_cost,
+        'avg_coverage': coverage,
+        'hub_locations': hubs,
+        'fixed_cost':   info_site.get('fixed_cost', 0),
+        'transport':    total_transport,
+        'penalty':      total_penalty,
+    }
+
+
+# ── PPO update ─────────────────────────────────────────
+def ppo_update(trajectories, policy, optimizer, device,
+               gamma, gae_lambda, clip_epsilon, value_clip_epsilon,
+               ppo_epochs, target_kl, entropy_coef, writer, episode):
+
+    # Compute site-step GAE: the site step's return = discounted sum of all downstream rewards
+    site_advs = []
+    site_rets = []
+    for traj in trajectories:
+        ret = 0.0
+        for s in reversed(traj):
+            ret = s['reward'] + gamma * ret
+        site_val = traj[0]['value'].item()  # Critic value at site step
+        site_advs.append(ret - site_val)
+        site_rets.append(ret)
+
+    # Pre-normalize site advantages
+    site_adv_t = torch.tensor(site_advs, dtype=torch.float32).to(device)
+    if len(site_adv_t) > 1:
+        site_adv_t = (site_adv_t - site_adv_t.mean()) / (site_adv_t.std() + 1e-8)
+    site_ret_t = torch.tensor(site_rets, dtype=torch.float32).to(device)
+
+    for _epoch in range(ppo_epochs):
+        total_site_actor = 0.0
+        total_disp_actor = 0.0
+        total_site_critic = 0.0
+        total_entropy = 0.0
+        total_kl = 0.0
+        n_site = 0
+        n_disp = 0
+
+        for ti, traj in enumerate(trajectories):
+            # ── Site step (GAE + Critic) ──
+            s = traj[0]
+            logits, new_value = policy(s['obs'])
+            new_lp = policy.compute_site_log_prob(logits[0], s['action'])
+
+            old_lp = s['log_prob'].detach()
+            adv_i = site_adv_t[ti]
+            ret_i = site_ret_t[ti]
+
+            log_ratio = new_lp - old_lp
+            ratio = torch.exp(log_ratio)
+            kl = ((ratio - 1) - log_ratio).item()
+
+            surr1 = ratio * adv_i
+            surr2 = torch.clamp(ratio, 1 - clip_epsilon, 1 + clip_epsilon) * adv_i
+            site_actor = -torch.min(surr1, surr2)
+
+            val_clipped = s['value'] + torch.clamp(new_value - s['value'], -value_clip_epsilon, value_clip_epsilon)
+            v_loss = 0.5 * torch.max((new_value - ret_i)**2, (val_clipped - ret_i)**2)
+
+            total_site_actor += site_actor
+            total_site_critic += v_loss
+            total_kl += kl
+            n_site += 1
+
+            # ── Dispatch steps (per-node cost advantage, no Critic) ──
+            lstm_hidden = None
+            for s in traj[1:]:
+                obs = s['obs']
+                obs['lstm_hidden'] = lstm_hidden
+                logits, _, lstm_hidden = policy(obs)
+
+                new_per_lp, _ = policy.compute_dispatch_log_prob(logits, s['action'].unsqueeze(0))
+                # new_per_lp: (N,), old_per_lp: (N,), per_node_adv: (N,)
+
+                old_per_lp = s['per_node_lp'].detach()
+                per_node_adv = s['per_node_adv']
+
+                log_ratio_i = new_per_lp - old_per_lp
+                ratio_i = torch.exp(log_ratio_i)
+                kl_i = ((ratio_i - 1) - log_ratio_i).mean().item()
+
+                surr1_i = ratio_i * per_node_adv
+                surr2_i = torch.clamp(ratio_i, 1 - clip_epsilon, 1 + clip_epsilon) * per_node_adv
+                disp_actor = -torch.min(surr1_i, surr2_i).mean()
+
+                from torch.distributions import Categorical
+                entropy = Categorical(logits=logits).entropy().mean()
+
+                total_disp_actor += disp_actor
+                total_entropy += entropy
+                total_kl += kl_i
+                n_disp += 1
+
+        n_total = max(n_site + n_disp, 1)
+        avg_kl = total_kl / n_total
+
+        if avg_kl > 1.5 * target_kl:
+            break
+
+        loss = (total_site_actor / max(n_site, 1) +
+                total_disp_actor / max(n_disp, 1) +
+                total_site_critic / max(n_site, 1))
+        loss = loss - entropy_coef * (total_entropy / max(n_disp, 1))
+
+        optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=0.5)
+        optimizer.step()
+
+    writer.add_scalar("PPO/site_actor_loss", (total_site_actor / max(n_site, 1)).item(), episode)
+    writer.add_scalar("PPO/disp_actor_loss", (total_disp_actor / max(n_disp, 1)).item(), episode)
+    writer.add_scalar("PPO/site_critic_loss", (total_site_critic / max(n_site, 1)).item(), episode)
+    writer.add_scalar("PPO/approx_kl", avg_kl, episode)
+    writer.add_scalar("PPO/entropy_dispatch", total_entropy / max(n_disp, 1), episode)
+    writer.add_scalar("Stats/site_adv_mean", site_adv_t.mean().item(), episode)
+    writer.add_scalar("Stats/site_ret_mean", site_ret_t.mean().item(), episode)
+
+
+# ── Main training loop ─────────────────────────────────
 def train():
     cfg = UAVHubConfig()
-    set_global_seed(cfg.seed) 
+    set_global_seed(cfg.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"🚀 训练启动！当前设备: {device}")
-    
+    print(f"Training start [Option B: Site + Dispatch PPO]. Device: {device}")
+
     models_dir = os.path.join(current_module_dir, "models")
     logs_base_dir = os.path.join(current_module_dir, "logs")
     os.makedirs(models_dir, exist_ok=True)
-    
     run_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     run_log_dir = os.path.join(logs_base_dir, f"run_{run_time}")
     os.makedirs(run_log_dir, exist_ok=True)
     writer = SummaryWriter(log_dir=run_log_dir)
 
     env = RobustHubEnv(cfg)
-    policy = GraphAttentionPPO(N=cfg.N, max_hubs=cfg.max_hubs).to(device)
-    optimizer = Adam(policy.parameters(), lr=1e-4)
+    K = cfg.max_hubs
 
-    # --------------------------------------------------
-    # 【PPO 基础超参数】
-    # --------------------------------------------------
+    policy = GraphAttentionPPO(N=env.N, node_dim=5, hidden_dim=128, K=K).to(device)
+
+    initial_lr = 3e-4
+    final_lr = 3e-5
+    optimizer = Adam(policy.parameters(), lr=initial_lr)
+
     gamma = 0.99
+    gae_lambda = 0.95
     clip_epsilon = 0.2
-    
-    # 💡 恢复为 5：因为有了底层的 KL 动态早停作保镖，
-    # 我们可以放心地让网络在安全的环境下跑满 5 次迭代，最大化前期爬坡速度！
-    ppo_epochs = 5      
-    max_episodes = 2000  
-    best_reward = -float('inf')
-    UPDATE_FREQ = 1  
+    value_clip_epsilon = 2.0
+    ppo_epochs = 4
 
-    for episode in range(1, max_episodes + 1):
-        
-        # ==========================================================
-        # 🏆 【核心亮点：探索与学习步长的解耦退火 (Decoupled Annealing)】
-        # 痛点：传统 PPO 将学习率(lr)和探索率(entropy)同步衰减。在 1000 局后，
-        # 探索率过低导致模型陷入局部最优，但此时较高的学习率反而会将模型推离好不容易找到的解，引发剧烈震荡。
-        # 对策：提升探索率的底线，确保中后期依然具备逃逸局部最优的“好奇心”。
-        # ==========================================================
-        frac = 1.0 - (episode - 1.0) / max_episodes 
-        
-        # 学习率正常衰减，让步伐越迈越稳 (1e-4 -> 1e-5)
-        current_lr = 1e-4 * frac + 1e-5 
+    update_timestep = 480
+    max_episodes = 5000
+
+    best_eval_cost = float('inf')
+    last_eval_episode = 0
+    eval_interval = 50
+
+    initial_entropy_coef = 0.05
+    final_entropy_coef = 0.001
+    target_kl = 0.03
+
+    episode = 0
+
+    while episode < max_episodes:
+        progress = episode / max_episodes
+        anneal = max(0.0, (progress - 0.5) * 2.0)
+        current_lr = initial_lr + (final_lr - initial_lr) * anneal
+        entropy_coef = initial_entropy_coef + (final_entropy_coef - initial_entropy_coef) * anneal
         for param_group in optimizer.param_groups:
             param_group['lr'] = current_lr
-            
-        # 探索率底线提升至 0.01 (0.05 -> 0.01)，解耦退火速度，防止“死脑筋”现象
-        current_entropy_coef = 0.05 * frac + 0.01 
-        
-        # ==========================================================
-        # 🛡️ 【核心亮点：动态自适应 KL 散度防线 (Dynamic KL Threshold)】
-        # 逻辑：训练前期策略变动大，防线应宽容以鼓励试错 (0.015)；
-        # 训练后期策略趋于平稳，防线应极其严苛以防止崩盘 (0.005)。
-        # 完美解决固定阈值在后期失效、导致过度拟合的数学悖论。
-        # ==========================================================
-        current_target_kl = 0.015 * frac + 0.005
 
-        state, _ = env.reset()
-        done = False
-        states_pool, actions_pool, log_probs_pool, values_pool, rewards_pool, masks_pool = [], [], [], [], [], []
-        ep_reward = 0
-        
-        # --------------------------------------------------
-        # 【阶段一：与极端潮汐环境交互，收集数据】
-        # --------------------------------------------------
-        while not done:
-            states_pool.append(copy.deepcopy(state))
-            state_tensor = torch.FloatTensor(state).unsqueeze(0).to(device)
-            dist, value = policy(state_tensor)
-            logits = dist.logits.squeeze(0)
-            
-            mask = get_action_mask(state, cfg.max_hubs, cfg.N, device, env.hub_locations)
-            masks_pool.append(mask)
-            
-            # 🛡️ 深度掩码保护：使用 -1e8 阻断无效动作，保护底层 float32 精度不出现 NaN
-            masked_logits = logits.masked_fill(mask == False, -1e8)
-            safe_dist = Categorical(logits=masked_logits)
-            
-            action = safe_dist.sample()
-            next_state, reward, terminated, truncated, info = env.step(action.item())
-            done = terminated or truncated 
-            
-            actions_pool.append(action)
-            log_probs_pool.append(safe_dist.log_prob(action))
-            values_pool.append(value.squeeze())
-            rewards_pool.append(reward)
-            state = next_state
-            ep_reward += reward
-            
-        # --------------------------------------------------
-        # 【阶段二：计算折扣回报与标准化优势函数 (Advantage)】
-        # --------------------------------------------------
-        returns = []
-        if truncated:
-            next_state_tensor = torch.FloatTensor(next_state).unsqueeze(0).to(device)
-            with torch.no_grad():
-                _, next_value = policy(next_state_tensor)
-                discounted_r = next_value.item()
-        else:
-            discounted_r = 0.0 
+        trajectories = []
+        collected_steps = 0
 
-        for r in reversed(rewards_pool):
-            discounted_r = r + gamma * discounted_r
-            returns.insert(0, discounted_r)
-            
-        returns_tensor = torch.tensor(returns, dtype=torch.float32).to(device)
-        old_states = torch.FloatTensor(np.array(states_pool)).to(device)
-        old_actions = torch.stack(actions_pool).to(device)
-        old_log_probs = torch.stack(log_probs_pool).detach().to(device)
-        old_values = torch.stack(values_pool).detach().to(device)
-        old_masks = torch.stack(masks_pool).to(device)
-        
-        advantages = returns_tensor - old_values
-        if advantages.numel() > 1:
-            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        while collected_steps < update_timestep and episode < max_episodes:
+            episode += 1
+            obs, _ = env.reset()
+            traj = []
 
-        # --------------------------------------------------
-        # 【阶段三：PPO 网络核心更新与动态拦截】
-        # --------------------------------------------------
-        for _ in range(ppo_epochs):
-            new_dist, new_values = policy(old_states)
-            new_logits = new_dist.logits
-            
-            masked_new_logits = new_logits.masked_fill(old_masks == False, -1e8)
-            new_safe_dist = Categorical(logits=masked_new_logits)
-            new_log_probs = new_safe_dist.log_prob(old_actions)
-            
-            # 🏆 采用严格的平方 KL 散度近似：0.5 * (old - new)^2
-            # 消除 (old - new) 带来的不对称数学陷阱，确保“防抱死系统”不会被负值骗过。
-            with torch.no_grad():
-                approx_kl = 0.5 * (old_log_probs - new_log_probs).pow(2).mean().item()
-            
-            # 触发动态早停 (Dynamic Early Stopping)：一旦策略偏移量超过当前严格的阈值，立刻中断保护大脑！
-            if approx_kl > 1.5 * current_target_kl:
-                break
-                
-            entropy = new_safe_dist.entropy().mean()
-            
-            # 底层截断防爆锁，防止 torch.exp() 产生无穷大
-            log_ratio = torch.clamp(new_log_probs - old_log_probs, min=-20.0, max=5.0)
-            ratio = torch.exp(log_ratio)
-            
-            surr1 = ratio * advantages
-            surr2 = torch.clamp(ratio, 1.0 - clip_epsilon, 1.0 + clip_epsilon) * advantages
-            
-            actor_loss = -torch.min(surr1, surr2).mean()
-            critic_loss = F.mse_loss(new_values.squeeze(-1), returns_tensor)
-            
-            total_loss = actor_loss + 0.5 * critic_loss - current_entropy_coef * entropy
-            
-            optimizer.zero_grad()
-            total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=0.5)
-            optimizer.step()
+            # ── Site step ──
+            t_obs = obs_to_tensors(obs, device)
+            logits, value = policy(t_obs)
+            hubs, site_lp = policy.sample_site(logits[0])
+            next_obs, reward_site, _, _, info_site = env.step(np.array(hubs))
 
-        # --------------------------------------------------
-        # 【阶段四：指标记录与终端账单级打印】
-        # --------------------------------------------------
-        writer.add_scalar("Train/Reward", ep_reward, episode)
-        writer.add_scalar("Train/Cost_Total", info.get("avg_cost", 0), episode)
-        writer.add_scalar("Metric/Coverage", info["avg_coverage"], episode)
+            traj.append({
+                'obs':     clone_obs(t_obs),
+                'action':  hubs,
+                'log_prob': site_lp,
+                'value':   value.squeeze().detach(),
+                'reward':  reward_site,
+            })
 
-        if ep_reward > best_reward:
-            best_reward = ep_reward
-            torch.save(policy.state_dict(), os.path.join(models_dir, "best_gat_policy.pth"))
-            print(f"⭐ Ep {episode:03d} | New Best Reward: {best_reward:.2f} | Total Cost: {info.get('avg_cost', 0):.0f} (Op: {info.get('operational_cost', 0):.0f}, Fix: {info.get('fixed_cost', 0):.0f}, Idle: {info.get('idle_penalty', 0):.0f}, Std: {info.get('std_op_cost', 0):.0f}) | Cov: {info['avg_coverage']*100:.1f}% | Hubs: {info['active_hubs']}")
-            
-        elif episode % 10 == 0:
-            print(f"🎮 Ep {episode:03d} | Reward: {ep_reward:.2f} | Total Cost: {info.get('avg_cost', 0):.0f} (Op: {info.get('operational_cost', 0):.0f}, Fix: {info.get('fixed_cost', 0):.0f}, Idle: {info.get('idle_penalty', 0):.0f}, Std: {info.get('std_op_cost', 0):.0f}) | Cov: {info['avg_coverage']*100:.1f}% | Hubs: {info['active_hubs']}")
+            ep_transport = 0.0
+            ep_penalty = 0.0
+
+            # ── Dispatch steps ──
+            done = False
+            lstm_hidden = None
+            while not done:
+                t_obs = obs_to_tensors(next_obs, device)
+                t_obs['lstm_hidden'] = lstm_hidden
+
+                logits, value, lstm_hidden = policy(t_obs)
+                actions, per_node_lp, sum_lp = policy.sample_dispatch(logits)
+
+                next_obs, reward, done, _, info = env.step(actions.cpu().numpy())
+
+                # Per-node advantage = -per_node_cost / 100 (same scale as step reward)
+                per_node_cost = torch.FloatTensor(info['per_node_cost']).to(device)
+                per_node_adv = -per_node_cost / 100.0
+
+                traj.append({
+                    'obs':          clone_obs(t_obs),
+                    'action':       actions.clone().detach(),
+                    'log_prob':     sum_lp,
+                    'per_node_lp':  per_node_lp.detach(),
+                    'per_node_adv': per_node_adv,
+                    'value':        value.squeeze().detach(),
+                    'reward':       reward,
+                })
+
+                ep_transport += info['transport_cost']
+                ep_penalty += info['unmet_penalty']
+
+                if info['t'] in [32, 72]:
+                    print(f"   [Dispatch] t={info['t']}/96 | active={info['active_orders']} | "
+                          f"served={info['served_per_hub']}")
+
+            collected_steps += len(traj)
+            trajectories.append(traj)
+
+            ep_cost = -reward_site * 100.0 + ep_transport + ep_penalty
+            ep_cov = 1.0 - ep_penalty / max(ep_transport + ep_penalty, 1.0)
+
+            writer.add_scalar("Train/Cost", ep_cost, episode)
+            writer.add_scalar("Train/Coverage", ep_cov, episode)
+            writer.add_scalar("Train/Transport", ep_transport, episode)
+            writer.add_scalar("Train/Penalty", ep_penalty, episode)
+            writer.add_scalar("Train/FixedCost", -reward_site * 100.0, episode)
+
+            print(f"[Ep {episode:04d}] hubs={hubs} | cost={ep_cost:.0f} | "
+                  f"transport={ep_transport:.0f} | penalty={ep_penalty:.0f} | cov={ep_cov*100:.1f}%")
+
+        # ── PPO update ──
+        ppo_update(
+            trajectories, policy, optimizer, device,
+            gamma, gae_lambda, clip_epsilon, value_clip_epsilon,
+            ppo_epochs, target_kl, entropy_coef, writer, episode
+        )
+        writer.add_scalar("PPO/lr", current_lr, episode)
+
+        # ── Eval ──
+        if episode - last_eval_episode >= eval_interval:
+            last_eval_episode = episode
+            eval_env = RobustHubEnv(cfg, mode='eval')
+            eval_info = deterministic_eval(eval_env, policy, device)
+            eval_cost = eval_info['avg_cost']
+            eval_cov = eval_info['avg_coverage']
+            eval_hubs = eval_info['hub_locations']
+
+            writer.add_scalar("Eval/Cost", eval_cost, episode)
+            writer.add_scalar("Eval/Coverage", eval_cov, episode)
+
+            if eval_cost < best_eval_cost and eval_cost > 0:
+                best_eval_cost = eval_cost
+                torch.save(policy.state_dict(), os.path.join(models_dir, "best_eval_policy.pth"))
+                print(f"[EVAL BEST] Ep {episode:04d} | cost={eval_cost:.0f} | "
+                      f"cov={eval_cov*100:.1f}% | hubs={eval_hubs}")
+            else:
+                print(f"[EVAL] Ep {episode:04d} | cost={eval_cost:.0f} | "
+                      f"cov={eval_cov*100:.1f}% | hubs={eval_hubs}")
 
     final_model_path = os.path.join(models_dir, "final_gat_policy.pth")
     torch.save(policy.state_dict(), final_model_path)
     writer.close()
-    
-    print("✅ 训练完成！最强大脑已锁定。")
+    print("Training complete. Model saved.")
+
 
 if __name__ == "__main__":
     train()

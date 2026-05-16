@@ -1,7 +1,10 @@
+import sys
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8')
+
 import numpy as np
 import os
 import pickle
-import sys
 
 # ==========================================
 # 【核心寻址】确保能找到项目根目录
@@ -15,142 +18,185 @@ from config import UAVHubConfig
 
 def generate_and_save_data():
     cfg = UAVHubConfig()
-    N = cfg.N
-    seed = cfg.seed
+    map_size = cfg.map_size          
+    seed = cfg.seed                  
     np.random.seed(seed)
     
     print("=================================================")
-    print(f"🌍 开始生成 [带隔离带的严格栅格化 3D 城市底座]")
+    print(f"🌍 开始生成 [POMDP 连续日场景需求网络 - 严密时序版]")
     
     # ==========================================
-    # 🌟 1. 带“隔离带”的网格分配引擎 (杜绝贴靠)
+    # 🌟 1~4. 3GPP 物理基座 (完全保留)
     # ==========================================
-    grid_res = 50.0  
-    cells_per_axis = int(cfg.map_size / grid_res)  # 20x20 = 400 个格子
-    center = cfg.map_size / 2.0
+    block_size = 120.0   
+    street_width = 20.0  
+    cell_step = block_size + street_width 
+    building_coverage_ratio = 0.5  
+    city_open_area_ratio = 0.5     
     
-    grid_occupied = np.zeros((cells_per_axis, cells_per_axis), dtype=bool)
+    grid_dim = int(map_size / cell_step) 
+    total_cells = grid_dim * grid_dim
     
-    def get_free_cell(min_r, max_r):
-        for _ in range(2000): # 最多尝试 2000 次
-            gx = np.random.randint(0, cells_per_axis)
-            gy = np.random.randint(0, cells_per_axis)
-            px = gx * grid_res + grid_res / 2
-            py = gy * grid_res + grid_res / 2
+    all_cells = []
+    for gx in range(grid_dim):
+        for gy in range(grid_dim):
+            px = gx * cell_step + (street_width / 2.0) + (block_size / 2.0)
+            py = gy * cell_step + (street_width / 2.0) + (block_size / 2.0)
+            all_cells.append([px, py])
             
-            dist = np.linalg.norm([px - center, py - center])
-            if min_r <= dist <= max_r:
-                # 检查自身及周围 8 个邻居是否被占用 (3x3 安全隔离带)
-                x_min, x_max = max(0, gx-1), min(cells_per_axis, gx+2)
-                y_min, y_max = max(0, gy-1), min(cells_per_axis, gy+2)
-                
-                if not np.any(grid_occupied[x_min:x_max, y_min:y_max]):
-                    grid_occupied[gx, gy] = True 
-                    return px, py
-        raise ValueError("地图太拥挤，无法找到符合隔离要求的空地！请减少建筑物数量。")
+    all_cells = np.array(all_cells)
+    np.random.shuffle(all_cells)
+    num_building_cells = int(total_cells * (1 - city_open_area_ratio))
+    
+    coords = all_cells[:num_building_cells]  
+    open_cells = all_cells[num_building_cells:]      
+    actual_N = len(coords)
+    
+    print(f"🌍 物理尺寸: {map_size}x{map_size}m | 预留空地比: {int(city_open_area_ratio * 100)}%")
+    print(f"🔥 全城共 {total_cells} 个网格，生成 {actual_N} 个活跃需求建筑。")
 
-    coords = np.zeros((N, 2))
-    heights = np.zeros(N)       
-    node_types = np.zeros(N, dtype=int)  
+    heights = np.zeros(actual_N)       
+    node_types = np.zeros(actual_N, dtype=int)  
+    base_intensity = np.zeros(actual_N)
     
-    num_commercial = int(N * 0.3) 
-    num_residential = N - num_commercial 
+    num_commercial = int(actual_N * 0.3)
+    shuffled_indices = np.random.permutation(actual_N)
+    uma_indices = shuffled_indices[:num_commercial]
+    umi_indices = shuffled_indices[num_commercial:]
     
-    # 【分配商业区】市中心 (半径 0 ~ 250m)
-    for i in range(num_commercial):
-        coords[i] = get_free_cell(0, 250)
-        heights[i] = np.random.uniform(50.0, 120.0)
-        node_types[i] = 1
-        
-    # 【分配住宅区】外围 (半径 200m ~ 450m)
-    for i in range(num_residential):
-        idx = num_commercial + i
-        coords[idx] = get_free_cell(200, 450)
-        heights[idx] = np.random.uniform(10.0, 30.0)
-        node_types[idx] = 0
-        
-    # ==========================================
-    # 🌟 1.5 分层分配自然遮挡 (均匀分布在市中心和郊区)
-    # ==========================================
-    num_obstacles = getattr(cfg, 'num_obstacles', 15) 
-    obs_coords = np.zeros((num_obstacles, 2))
-    obs_heights = np.zeros(num_obstacles)
-    
-    # 刻意切分：约 30% 放市中心当市政公园/塔，剩下的放郊区
-    num_center_obs = int(num_obstacles * 0.3)
-    
-    for i in range(num_center_obs):
-        # 强制塞进 CBD 核心区 (半径 0~250)
-        obs_coords[i] = get_free_cell(0, 250)
-        obs_heights[i] = np.random.uniform(15.0, 45.0) 
-        
-    for i in range(num_center_obs, num_obstacles):
-        # 剩下的丢在郊区 (半径 250~500)
-        obs_coords[i] = get_free_cell(250, 500)
-        obs_heights[i] = np.random.uniform(15.0, 45.0) 
+    node_types[uma_indices] = 1 # UMa (商业)
+    node_types[umi_indices] = 0 # UMi (住宅)
 
-    # ==========================================
-    # 🌟 2. 距离与潮汐快照计算 
-    # ==========================================
-    C = np.zeros((N, N))
-    for i in range(N):
-        for j in range(N):
+    print("🏢 正在注入服务节点 3GPP 标准高度与容积需求系数...")
+    block_area = block_size * block_size 
+    
+    for i in uma_indices:
+        heights[i] = np.random.uniform(20.0, 120.0) 
+        floors = heights[i] / 3.0
+        far = (block_area * building_coverage_ratio * floors) / block_area
+        base_intensity[i] = far * 1.5  
+        
+    for i in umi_indices:
+        heights[i] = np.random.uniform(9.0, 30.0)   
+        floors = heights[i] / 3.0
+        far = (block_area * building_coverage_ratio * floors) / block_area
+        base_intensity[i] = far * 5.0  
+
+    C = np.zeros((actual_N, actual_N))
+    for i in range(actual_N):
+        for j in range(actual_N):
             C[i, j] = np.linalg.norm(coords[i] - coords[j])
             
-    f = np.full(N, getattr(cfg, 'f_min', 10000.0))
+    f = np.full(actual_N, getattr(cfg, 'f_min', 10000.0))
 
-    range_low = getattr(cfg, 'range_low', (1, 14))
-    range_normal = getattr(cfg, 'range_normal', (15, 30))
-    range_surge = getattr(cfg, 'range_surge', (30, 45))
-    
-    T_periods = getattr(cfg, 'T_periods', 4)
-    M_snapshots = getattr(cfg, 'M_snapshots', 100)
-    num_total_snapshots = M_snapshots * T_periods
-    snapshots_total = np.zeros((num_total_snapshots, N))
-    
-    tidal_states = [
-        (range_surge, range_low),       
-        (range_low, range_surge),       
-        (range_normal, range_normal),   
-        (range_low, range_low)          
-    ]
-    
-    snapshot_idx = 0
-    for t in range(T_periods):
-        state_R, state_C = tidal_states[t]
-        for m in range(M_snapshots):
-            demand_m = np.zeros(N)
-            demand_C = np.random.uniform(state_C[0], state_C[1], num_commercial)
-            demand_m[node_types == 1] = demand_C
-            demand_R = np.random.uniform(state_R[0], state_R[1], num_residential)
-            demand_m[node_types == 0] = demand_R
-            snapshots_total[snapshot_idx] = demand_m
-            snapshot_idx += 1
-    
-    # 打包存档
+    # ==========================================
+    # 🌟 5. 动态日场景生成 (修复时序残差与动态配置)
+    # ==========================================
+    T_timesteps = getattr(cfg, 'T_timesteps', 96)
+    num_train_scenarios = getattr(cfg, 'num_train_scenarios', 100)
+    num_eval_scenarios = getattr(cfg, 'num_eval_scenarios', 30) # 动态读取评估集大小
+    sigma = getattr(cfg, 'tidal_sigma', 1.5)
+    baseline = getattr(cfg, 'tidal_baseline', 0.1)
+    peaks_UMa = getattr(cfg, 'tidal_peaks_UMa', [(8.0, 2.4), (13.0, 0.9)])
+    peaks_UMi = getattr(cfg, 'tidal_peaks_UMi', [(13.0, 0.7), (18.0, 2.4)])
+
+    def get_smooth_tidal_multipliers(hour):
+        """完全由 config 驱动：每个节点类型的峰值列表独立叠加，无硬编码系数"""
+        uma_val = baseline
+        for peak_h, peak_mul in peaks_UMa:
+            uma_val += peak_mul * np.exp(-0.5 * ((hour - peak_h) / sigma)**2)
+
+        umi_val = baseline
+        for peak_h, peak_mul in peaks_UMi:
+            umi_val += peak_mul * np.exp(-0.5 * ((hour - peak_h) / sigma)**2)
+
+        return uma_val, umi_val
+
+    def generate_scenarios(num_days, dataset_name):
+        print(f"🌊 正在生成 {dataset_name} 数据: {num_days} 个完整的日场景...")
+        scenarios = []
+        for d in range(num_days):
+            day_data = np.zeros((T_timesteps, actual_N))
+            day_busyness = np.random.uniform(0.7, 1.3)
+            
+            # AR(1) 自回归状态，用于模拟 15 分钟级的情绪惯性
+            inertia_mult = 1.0 
+            
+            for t in range(T_timesteps):
+                hour = t * 24.0 / T_timesteps
+                mul_UMa, mul_UMi = get_smooth_tidal_multipliers(hour)
+                
+                # 更新 15 分钟级的时间残差惯性 (70% 继承上个槽的惯性，30% 产生新波动)
+                inertia_mult = 0.7 * inertia_mult + 0.3 * np.random.normal(1.0, 0.4)
+                inertia_mult = np.clip(inertia_mult, 0.5, 2.0) # 防止过度发散
+                
+                slot_duration_hours = 24.0 / T_timesteps 
+                expected_demand = np.zeros(actual_N)
+                
+                # 回归纯粹的物理基准需求，不使用缩放器
+                expected_demand[node_types == 1] = base_intensity[node_types == 1] * mul_UMa * slot_duration_hours * day_busyness * inertia_mult
+                expected_demand[node_types == 0] = base_intensity[node_types == 0] * mul_UMi * slot_duration_hours * day_busyness * inertia_mult
+                
+                sampled_demand = np.random.poisson(expected_demand).astype(float)
+                day_data[t] = sampled_demand * 1.2  # 乘以 1.2kg 的单均重量
+                
+            scenarios.append(day_data)
+        return np.array(scenarios)
+
+    # 分别生成训练集和评估集
+    train_scenarios = generate_scenarios(num_train_scenarios, "【训练集】")
+    eval_scenarios = generate_scenarios(num_eval_scenarios, "【评估集】")
+
+    # ==========================================
+    # 🌟 6. 数据打包与归档
+    # ==========================================
     topo_data = {
-        'coords': coords,            
-        'heights': heights,          
-        'obs_coords': obs_coords,    
-        'obs_heights': obs_heights,  
-        'C': C,
-        'f': f,
-        'node_types': node_types
+        'coords': coords, 'heights': heights, 
+        'obs_coords': np.array([]), 'obs_heights': np.array([]), 
+        'open_cells': open_cells, 'C': C, 'f': f, 
+        'node_types': node_types, 'base_intensity': base_intensity
     }
 
     data_dir = os.path.join(project_root, 'data')
     os.makedirs(data_dir, exist_ok=True)
-    file_path = os.path.join(data_dir, f'map_{N}n_seed{seed}_robust.pkl')
+    file_path = os.path.join(data_dir, f'map_adaptive_seed{seed}_robust.pkl')
     
     final_data = {
         'topo_data': topo_data,
-        'snapshots_total': snapshots_total,
-        'config_meta': {'N': N, 'seed': seed, 'M_snapshots': M_snapshots, 'T_periods': T_periods}
+        'daily_scenarios': train_scenarios, # 保留此 key 以防可视化脚本报错
+        'train_scenarios': train_scenarios, # 明确分离训练集
+        'eval_scenarios': eval_scenarios,   # 明确分离评估集
+        'config_meta': {
+            'map_size': map_size, 'block_size': block_size, 'street_width': street_width,
+            'N': actual_N, 'seed': seed, 
+            'T_timesteps': T_timesteps, 
+            'num_train_scenarios': num_train_scenarios,
+            'num_eval_scenarios': num_eval_scenarios
+        }
     }
     with open(file_path, 'wb') as f_out:
         pickle.dump(final_data, f_out)
 
-    print(f"✅ 带隔离带的网格化底座生成完毕，中心与边缘遮挡分布已优化！")
+    # ==========================================
+    # 💡 物理容量压力核算与配置建议
+    # ==========================================
+    max_train_peak = np.max(np.sum(train_scenarios, axis=2))
+    current_Q = getattr(cfg, 'Q', 1500)
+    total_capacity = current_Q * getattr(cfg, 'max_hubs', 3)
+    
+    print("-" * 50)
+    print(f"🚨 [容量抗压核对] 全城 15 分钟并发需求峰值达: {max_train_peak:.1f} kg")
+    print(f"   ➤ 当前 config.py 中 Q={current_Q}，全城总容量为 {total_capacity} kg。")
+    
+    if max_train_peak > total_capacity:
+        print("   ➤ 状态：完美！峰值已击穿当前总容量，必定触发 RL 负载均衡！")
+    else:
+        # 给出科学的改参建议（容量设为峰值的 1/3 到 1/4 左右最为合适）
+        suggested_Q = int((max_train_peak * 0.8) / getattr(cfg, 'max_hubs', 3) / 100) * 100 
+        print(f"   ➤ 状态：过载压力不足！当前总容量 ({total_capacity} kg) 远大于需求峰值 ({max_train_peak:.1f} kg)。")
+        print(f"   ➤ 建议：请前往 config.py，将 Q 值调低至约 【{suggested_Q}】，以保证在高峰期触发 20%~30% 的容量缺口！")
+    print("-" * 50)
+    print(f"✅ 数据生成完毕！已保存至: {file_path}")
 
 if __name__ == '__main__':
     generate_and_save_data()
