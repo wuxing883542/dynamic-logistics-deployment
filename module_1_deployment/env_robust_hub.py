@@ -16,12 +16,13 @@ from config import UAVHubConfig
 
 class RobustHubEnv(gym.Env):
     """
-    单阶段动态调度 PPO 环境（纯粹分配）
+    半自回归动态调度 PPO 环境（纯粹分配）- 👑 Tier 2 终极破局版
     
     核心特性：
     1. 彻底解耦选址：初始化时利用 K-Means + 峰值贪婪锁定 K 个枢纽。
     2. 真·马尔可夫决策：运力在全天真实累积消耗，迫使 AI 学会“囤积运力”。
-    3. IPPO (多智能体信用分配)：每个节点独立核算奖励，解决联合动作空间下的吃大锅饭问题！
+    3. IPPO (多智能体信用分配)：每个节点独立核算奖励，解决联合动作空间下的吃大锅饭问题。
+    4. 半自回归批次执行 (Chunking)：大单先决策先扣减，小单看残羹做避让，消灭物理并发碰撞！
     """
 
     metadata = {"render_modes": []}
@@ -57,19 +58,23 @@ class RobustHubEnv(gym.Env):
         self.max_radius = getattr(self.cfg, 'max_flight_radius', 750.0)
         self.action_mask = self._build_spatial_action_mask()
 
-        # ── 3. 状态与业务统计变量 ──
+        # ── 3. 👑 状态与业务统计变量 & 分批配置 ──
         self.current_scenario = None   
         self.current_t = 0             
         self.hub_capacities = np.zeros(self.K)
         
         self.ep_total_demand = 0.0
         self.ep_total_unmet = 0.0
+        
+        # 💡 [新增] 设置半自回归的批次数量
+        self.num_chunks = 3 
 
         # ── 4. 动作与观测空间设计 ──
         self.action_space = spaces.MultiDiscrete([self.K + 1] * self.N)
 
+        # 💡 [确认] 这里的 node_features 维度已经是 6 维
         self.observation_space = spaces.Dict({
-            'node_features':   spaces.Box(low=-1.0, high=1.0, shape=(self.N, 5), dtype=np.float32),
+            'node_features':   spaces.Box(low=-1.0, high=1.0, shape=(self.N, 6), dtype=np.float32),
             'current_orders':  spaces.Box(low=0.0, high=np.inf, shape=(self.N,), dtype=np.float32),
             'hub_mask':        spaces.Box(low=0.0, high=1.0, shape=(self.N,), dtype=np.float32),
             'hub_capacities':  spaces.Box(low=0.0, high=1.0, shape=(self.K,), dtype=np.float32),
@@ -115,14 +120,14 @@ class RobustHubEnv(gym.Env):
         self.current_scenario = scenarios[day_idx]
 
         self.current_t = 0
-        self.hub_capacities = np.full(self.K, self.cfg.Q)
+        self.hub_capacities = np.full(self.K, self.cfg.Q, dtype=np.float32)
         self.ep_total_demand = 0.0
         self.ep_total_unmet = 0.0
 
         return self._get_obs(), {}
 
     def _get_obs(self):
-        # 💡 [改动 1] 维度从 5 改成 6
+        # 💡 [保留] 维度从 5 改成 6
         node_f = np.zeros((self.N, 6), dtype=np.float32)
         node_f[:, 0] = self.coords[:, 0] / self.cfg.map_size          
         node_f[:, 1] = self.coords[:, 1] / self.cfg.map_size          
@@ -134,11 +139,9 @@ class RobustHubEnv(gym.Env):
 
         orders = self.current_scenario[self.current_t].astype(np.float32) if self.current_t < self.T else np.zeros(self.N, dtype=np.float32)
 
-        # 💡 [改动 2] 新增第 6 维：当前时刻的“相对抢单优先级” (0.0 到 1.0)
-        # 需求越大的节点，得分越接近 1.0，让网络知道“我会被环境优先处理，我能抢到枢纽！”
+        # 💡 [保留] 新增第 6 维：当前时刻的“相对抢单优先级” (0.0 到 1.0)
         active_idx = np.where(orders > 0)[0]
         if len(active_idx) > 0:
-            # 两次 argsort 可以得到每个元素的排名
             ranks = np.argsort(np.argsort(orders[active_idx])) 
             norm_ranks = ranks / max(1, len(active_idx) - 1)
             node_f[active_idx, 5] = norm_ranks
@@ -153,7 +156,8 @@ class RobustHubEnv(gym.Env):
             'hub_mask':       hub_mask,
             'hub_capacities': self.hub_capacities.copy() / max(self.cfg.Q, 1.0),
         }
-    # ── 物理推演与结算 ───────────────────────────────────────────────
+
+    # ── 👑 物理推演与结算 (半自回归重构) ──────────────────────────────────
     def step(self, action):
         action = np.asarray(action, dtype=np.int32).flatten()
         orders = self.current_scenario[self.current_t]
@@ -166,61 +170,70 @@ class RobustHubEnv(gym.Env):
         step_allocated = 0.0
         step_unmet = 0.0
 
-        # 💡 [IPPO核心修改] 为每个节点设立独立的“账本”
+        # [IPPO核心] 为每个节点设立独立的“账本”
         per_node_cost = np.zeros(self.N, dtype=np.float32)
 
-        sorted_idx = np.argsort(-orders[active_nodes])
+        # 👑 核心重构：建立分批串行模拟机制
+        if len(active_nodes) > 0:
+            # 严格按订单量从大到小对节点进行排序
+            sorted_active = active_nodes[np.argsort(-orders[active_nodes])]
+            # 分成 num_chunks (3) 批
+            chunks = np.array_split(sorted_active, self.num_chunks)
+            
+            # 批次串行执行：前面的批次真正改写局部物理状态，后面的批次吃残羹
+            for chunk_idx, chunk_nodes in enumerate(chunks):
+                for i in chunk_nodes:
+                    demand = orders[i]
+                    hub_choice = action[i]
 
-        for idx in sorted_idx:
-            i = active_nodes[idx]
-            demand = orders[i]
-            hub_choice = action[i]
+                    if hub_choice == self.K:
+                        step_unmet += demand
+                        penalty = demand * self.cfg.penalty_unmet
+                        unmet_penalty += penalty
+                        per_node_cost[i] += penalty  # 记入独立账本
+                    else:
+                        dist = self.dist_matrix[i, self.hub_locations[hub_choice]]
+                        
+                        if dist > self.max_radius:
+                            allocated = 0.0
+                        else:
+                            # 💥 物理结算核心差异：
+                            # 此时的容量 hub_capacities 已经是被上一个批次扣减过后的“真实血条”
+                            allocated = min(demand, self.hub_capacities[hub_choice])
 
-            if hub_choice == self.K:
-                step_unmet += demand
-                penalty = demand * self.cfg.penalty_unmet
-                unmet_penalty += penalty
-                per_node_cost[i] += penalty  # 记入独立账本
-            else:
-                dist = self.dist_matrix[i, self.hub_locations[hub_choice]]
-                
-                if dist > self.max_radius:
-                    allocated = 0.0
-                else:
-                    allocated = min(demand, self.hub_capacities[hub_choice])
-
-                cost = allocated * dist * 0.01
-                transport_cost += cost
-                per_node_cost[i] += cost     # 记入独立账本
-                self.hub_capacities[hub_choice] -= allocated  
-                step_allocated += allocated
-                
-                if allocated < demand:
-                    missed = demand - allocated
-                    step_unmet += missed
-                    penalty = missed * self.cfg.penalty_unmet
-                    unmet_penalty += penalty
-                    per_node_cost[i] += penalty # 记入独立账本
+                        cost = allocated * dist * 0.01
+                        transport_cost += cost
+                        per_node_cost[i] += cost     # 记入独立账本
+                        
+                        # 物理状态发生级联式的实时转移！
+                        self.hub_capacities[hub_choice] -= allocated  
+                        step_allocated += allocated
+                        
+                        if allocated < demand:
+                            missed = demand - allocated
+                            step_unmet += missed
+                            penalty = missed * self.cfg.penalty_unmet
+                            unmet_penalty += penalty
+                            per_node_cost[i] += penalty # 记入独立账本
 
         self.ep_total_demand += step_demand
         self.ep_total_unmet += step_unmet
 
         # =======================================================
-        # 👑 多智能体独立奖励 (Per-Node Reward) - IPPO灵魂
+        # 多智能体独立奖励 (Per-Node Reward)
         # =======================================================
         
-        # 1. 基础惩罚：每个节点只为自己的运费和拒单买单 (完美切断大锅饭)
-        # 量级对齐百万级缩放
+        # 1. 基础惩罚：量级对齐百万级缩放
         node_rewards = -per_node_cost / 1000000.0
         
-        # 2. 全局分红：大盘利用率当成系统奖金，平分给所有人
+        # 2. 全局分红
         utilization_reward = 0.01 * (step_allocated / max(step_demand, 1.0))
         node_rewards += utilization_reward
 
         self.current_t += 1
         terminated = self.current_t >= self.T
 
-        # 3. 终局大奖也是阳光普照
+        # 3. 终局大奖
         if terminated:
             final_coverage = 1.0 - (self.ep_total_unmet / max(self.ep_total_demand, 1e-5))
             jackpot_reward = 5.0 * (final_coverage ** 10)
@@ -236,10 +249,9 @@ class RobustHubEnv(gym.Env):
             'step_demand':     step_demand, 
             'step_unmet':      step_unmet,  
             'ep_coverage':     final_coverage if terminated else 0.0,
-            'node_rewards':    node_rewards # 💡 传出独立奖励数组
+            'node_rewards':    node_rewards # 传出独立奖励数组
         }
 
-        # gym 要求 step 返回标量 reward，返回均值应付 API (训练不用它)
         return self._get_obs(), float(np.mean(node_rewards)), terminated, False, info
 
 if __name__ == '__main__':
@@ -247,4 +259,4 @@ if __name__ == '__main__':
     cfg = UAVHubConfig()
     env = RobustHubEnv(cfg, mode='train')
     obs, _ = env.reset()
-    print(">>> 环境实例化与 Reset 成功，全局时空运筹与 IPPO 模式已激活！")
+    print(">>> 环境实例化与 Reset 成功，半自回归串行结算机制已激活！")
