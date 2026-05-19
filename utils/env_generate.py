@@ -23,7 +23,7 @@ def generate_and_save_data():
     np.random.seed(seed)
     
     print("=================================================")
-    print(f"🌍 开始生成 [POMDP 连续日场景需求网络 - 严密时序版]")
+    print(f"🌍 开始生成 [POMDP 连续日场景需求网络 - 纯动态分配版]")
     
     # ==========================================
     # 🌟 1~4. 3GPP 物理基座 (完全保留)
@@ -87,25 +87,14 @@ def generate_and_save_data():
         for j in range(actual_N):
             C[i, j] = np.linalg.norm(coords[i] - coords[j])
             
-    # 💡 [核心修复] 引入异质性建站成本
-    f_min = getattr(cfg, 'f_min', 10000.0)
-    f_max = getattr(cfg, 'f_max', 20000.0)
-    
-    # 按照建筑高度（容积率）来计算地价归一化系数
-    height_norm = (heights - np.min(heights)) / (np.max(heights) - np.min(heights) + 1e-8)
-    
-    # 高楼（商业区）贵，矮楼（住宅区）便宜
-    f = f_min + height_norm * (f_max - f_min)
-    
-    # 加一点均匀分布的现实地价噪音 (±500)，防止被网络抓到纯线性漏洞
-    noise = np.random.uniform(-500.0, 500.0, size=actual_N)
-    f = np.clip(f + noise, f_min, f_max)
+    # 💡 [已剔除] 与选址相关的异质性建站成本 f、噪音等逻辑已全部删除。
+
     # ==========================================
-    # 🌟 5. 动态日场景生成 (修复时序残差与动态配置)
+    # 🌟 5. 动态日场景生成 (完全保留原版潮汐逻辑与数值)
     # ==========================================
     T_timesteps = getattr(cfg, 'T_timesteps', 96)
     num_train_scenarios = getattr(cfg, 'num_train_scenarios', 100)
-    num_eval_scenarios = getattr(cfg, 'num_eval_scenarios', 30) # 动态读取评估集大小
+    num_eval_scenarios = getattr(cfg, 'num_eval_scenarios', 30) 
     sigma = getattr(cfg, 'tidal_sigma', 1.5)
     baseline = getattr(cfg, 'tidal_baseline', 0.1)
     peaks_UMa = getattr(cfg, 'tidal_peaks_UMa', [(8.0, 2.4), (13.0, 0.9)])
@@ -149,7 +138,8 @@ def generate_and_save_data():
                 expected_demand[node_types == 0] = base_intensity[node_types == 0] * mul_UMi * slot_duration_hours * day_busyness * inertia_mult
                 
                 sampled_demand = np.random.poisson(expected_demand).astype(float)
-                day_data[t] = sampled_demand * 1.2  # 乘以 1.2kg 的单均重量
+                # 💡 [数值原封不动] 完全保留了原版 * 1.2 的设定，维持牛顿 (N) 的量级
+                day_data[t] = sampled_demand * 1.2  
                 
             scenarios.append(day_data)
         return np.array(scenarios)
@@ -164,7 +154,8 @@ def generate_and_save_data():
     topo_data = {
         'coords': coords, 'heights': heights, 
         'obs_coords': np.array([]), 'obs_heights': np.array([]), 
-        'open_cells': open_cells, 'C': C, 'f': f, 
+        'open_cells': open_cells, 'C': C, 
+        # 💡 [已剔除] 'f': f 已从字典中彻底移除
         'node_types': node_types, 'base_intensity': base_intensity
     }
 
@@ -192,19 +183,19 @@ def generate_and_save_data():
     # 💡 物理容量压力核算与配置建议
     # ==========================================
     max_train_peak = np.max(np.sum(train_scenarios, axis=2))
-    current_Q = getattr(cfg, 'Q', 1500)
+    current_Q = getattr(cfg, 'Q', 500)
     total_capacity = current_Q * getattr(cfg, 'max_hubs', 3)
     
     print("-" * 50)
-    print(f"🚨 [容量抗压核对] 全城 15 分钟并发需求峰值达: {max_train_peak:.1f} kg")
-    print(f"   ➤ 当前 config.py 中 Q={current_Q}，全城总容量为 {total_capacity} kg。")
+    print(f"🚨 [容量抗压核对] 全城 15 分钟并发需求峰值达: {max_train_peak:.1f} N")
+    print(f"   ➤ 当前 config.py 中 Q={current_Q}，全城总容量为 {total_capacity} N。")
     
     if max_train_peak > total_capacity:
         print("   ➤ 状态：完美！峰值已击穿当前总容量，必定触发 RL 负载均衡！")
     else:
         # 给出科学的改参建议（容量设为峰值的 1/3 到 1/4 左右最为合适）
         suggested_Q = int((max_train_peak * 0.8) / getattr(cfg, 'max_hubs', 3) / 100) * 100 
-        print(f"   ➤ 状态：过载压力不足！当前总容量 ({total_capacity} kg) 远大于需求峰值 ({max_train_peak:.1f} kg)。")
+        print(f"   ➤ 状态：过载压力不足！当前总容量 ({total_capacity} N) 远大于需求峰值 ({max_train_peak:.1f} N)。")
         print(f"   ➤ 建议：请前往 config.py，将 Q 值调低至约 【{suggested_Q}】，以保证在高峰期触发 20%~30% 的容量缺口！")
     print("-" * 50)
     print(f"✅ 数据生成完毕！已保存至: {file_path}")

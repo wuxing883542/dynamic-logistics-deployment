@@ -31,25 +31,35 @@ def visualize_tidal_data(pkl_file_name):
     street_width = meta.get('street_width', 20.0)
     half_b = block_size / 2.0
     map_size = meta.get('map_size', 2000.0)
+    K = meta.get('max_hubs', 3) # 尝试获取配置中的枢纽数量，默认为 3
 
     # ==========================================
-    # 🚀 全局数据抗压统计监控打印
+    # 🚀 全局数据抗压统计监控 & 运力 Q 验证
     # ==========================================
     global_max_node = np.max(scenarios)
     global_min_node = np.min(scenarios)
     
+    # 单步 (15分钟) 全城并发统计
     snapshot_totals = np.sum(scenarios, axis=2) 
-    max_total_demand = np.max(snapshot_totals)
-    min_total_demand = np.min(snapshot_totals)
+    max_step_demand = np.max(snapshot_totals)
+    min_step_demand = np.min(snapshot_totals)
 
-    print("-" * 50)
-    print(f"📊 连续日场景 (POMDP) 数据抗压监控:")
+    # 💡 核心改动：全天全城总需求统计 (适配最新 MDP 架构)
+    daily_totals = np.sum(scenarios, axis=(1, 2))
+    max_daily_demand = np.max(daily_totals)
+    mean_daily_demand = np.mean(daily_totals)
+
+    print("-" * 65)
+    print(f"📊 连续日场景 (POMDP) 数据抗压监控 & 全天运力(Q)设置参考:")
     print(f"   ➤ [数据规模] 共有 {num_days} 天数据，每天 {T_timesteps} 个时间槽")
-    print(f"   ➤ [局部极限] 所有时间槽中，单节点最大爆发量: {global_max_node:.2f} kg")
-    print(f"   ➤ [局部极限] 所有时间槽中，单节点最小沉寂量: {global_min_node:.2f} kg")
-    print(f"   ➤ [全城并发] 所有时间槽中，全城并发总需求最大峰值: {max_total_demand:.2f} kg")
-    print(f"   ➤ [全城并发] 所有时间槽中，全城并发总需求最小谷值: {min_total_demand:.2f} kg")
-    print("-" * 50)
+    print(f"   ➤ [单步局部] 15分钟内，单节点最大爆发: {global_max_node:.2f} N")
+    print(f"   ➤ [单步全城] 15分钟内，全城最大并发峰值: {max_step_demand:.2f} N")
+    print(f"   ➤ [全天大盘] 全城单日平均总需求: {mean_daily_demand:.2f} N")
+    print(f"   ➤ [全天大盘] 全城单日最高总需求: {max_daily_demand:.2f} N")
+    print(f"   💡 [参数设置建议] 假设系统配置了 K={K} 个枢纽：")
+    print(f"      - 宽裕运力配置 Q ≈ {max_daily_demand / K * 1.1:.0f} (满足极限爆单，毫无压力)")
+    print(f"      - 紧凑运筹配置 Q ≈ {mean_daily_demand / K * 0.9:.0f} (强烈推荐！逼迫AI结合LSTM学会囤积与取舍)")
+    print("-" * 65)
 
     # ==========================================
     # 样式配置
@@ -126,7 +136,7 @@ def visualize_tidal_data(pkl_file_name):
     
     ax2.set_title("全天候高斯平滑潮汐曲线 (100天均值)", fontsize=16, fontweight='bold', pad=35)
     ax2.set_xlabel("一天中的时间 (小时)", fontsize=13)
-    ax2.set_ylabel("平均单节点需求重量 (kg / 15分钟)", fontsize=13)
+    ax2.set_ylabel("平均单节点需求重量 (N / 15分钟)", fontsize=13)
     
     ax2.set_xticks(np.arange(0, 25, 2))
     ax2.set_xticklabels([f"{int(h)}:00" for h in np.arange(0, 25, 2)])
