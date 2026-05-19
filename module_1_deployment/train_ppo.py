@@ -48,7 +48,7 @@ def train():
     gae_lambda = 0.95       
     clip_epsilon = 0.2      
     c_value = 0.5           
-    c_entropy = 0.05        
+    c_entropy = 0.02        
     ppo_epochs = 4          
 
     ORDER_SCALE = 100.0
