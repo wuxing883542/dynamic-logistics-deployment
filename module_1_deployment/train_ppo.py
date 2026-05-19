@@ -217,7 +217,9 @@ def train():
         writer.add_scalar("1_Business/Total_Cost", ep_cost, episode)
         writer.add_scalar("1_Business/Transport_Cost", ep_transport, episode)
         writer.add_scalar("1_Business/Penalty_Cost", ep_penalty, episode)
-        
+        writer.add_scalar("1_Business/Transport_Per_Unit", 
+                  ep_transport / max(ep_demand * ep_cov, 1e-5), episode)
+
         writer.add_scalar("2_Loss/Predictor_MSE", pred_loss.item(), episode)
         writer.add_scalar("2_Loss/PPO_Actor", actor_loss.item(), episode)
         writer.add_scalar("2_Loss/PPO_Critic", critic_loss.item(), episode)

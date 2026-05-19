@@ -224,7 +224,7 @@ class RobustHubEnv(gym.Env):
         # =======================================================
         
         # 1. 基础惩罚：量级对齐百万级缩放
-        node_rewards = -per_node_cost / 1000000.0
+        node_rewards = -per_node_cost / 100.0
         
         # 2. 全局分红
         utilization_reward = 0.01 * (step_allocated / max(step_demand, 1.0))
