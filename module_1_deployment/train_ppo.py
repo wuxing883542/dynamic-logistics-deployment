@@ -43,7 +43,7 @@ def train():
     
     writer = SummaryWriter(log_dir=os.path.join(log_dir, 'separated_inference_run'))
 
-    total_episodes = 5000
+    total_episodes = 1000
     gamma = 0.99            
     gae_lambda = 0.95       
     clip_epsilon = 0.2      
@@ -78,6 +78,7 @@ def train():
         ep_penalty = 0.0
         ep_demand = 0.0
         ep_unmet = 0.0
+        step_covs = []  # 记录每步局部覆盖率
 
         predictor.eval()
         ppo_policy.eval()
@@ -126,11 +127,12 @@ def train():
                     torch.tensor(next_obs['current_orders'], dtype=torch.float32, device=device)
                 )
 
-                # 💡 修复报错：对接最新的物理统计指标
+                # 业务指标累加
                 ep_transport += info['transport_cost']
                 ep_penalty += info['unmet_penalty']
                 ep_demand += info['step_demand']
                 ep_unmet += info['step_unmet']
+                step_covs.append(info['step_coverage'])
 
                 obs = next_obs
 
@@ -217,8 +219,10 @@ def train():
         writer.add_scalar("1_Business/Total_Cost", ep_cost, episode)
         writer.add_scalar("1_Business/Transport_Cost", ep_transport, episode)
         writer.add_scalar("1_Business/Penalty_Cost", ep_penalty, episode)
-        writer.add_scalar("1_Business/Transport_Per_Unit", 
+        writer.add_scalar("1_Business/Transport_Per_Unit",
                   ep_transport / max(ep_demand * ep_cov, 1e-5), episode)
+        writer.add_scalar("1_Business/StepCov_Min", min(step_covs), episode)
+        writer.add_scalar("1_Business/StepCov_Std", np.std(step_covs), episode)
 
         writer.add_scalar("2_Loss/Predictor_MSE", pred_loss.item(), episode)
         writer.add_scalar("2_Loss/PPO_Actor", actor_loss.item(), episode)

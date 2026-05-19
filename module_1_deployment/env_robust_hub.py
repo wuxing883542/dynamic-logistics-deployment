@@ -65,9 +65,10 @@ class RobustHubEnv(gym.Env):
         
         self.ep_total_demand = 0.0
         self.ep_total_unmet = 0.0
-        
+        self.ep_step_covs = []  # 记录每步局部覆盖率，供终局公平性结算
+
         # 💡 [新增] 设置半自回归的批次数量
-        self.num_chunks = 3 
+        self.num_chunks = 3
 
         # ── 4. 动作与观测空间设计 ──
         self.action_space = spaces.MultiDiscrete([self.K + 1] * self.N)
@@ -123,6 +124,7 @@ class RobustHubEnv(gym.Env):
         self.hub_capacities = np.full(self.K, self.cfg.Q, dtype=np.float32)
         self.ep_total_demand = 0.0
         self.ep_total_unmet = 0.0
+        self.ep_step_covs = []
 
         return self._get_obs(), {}
 
@@ -230,13 +232,21 @@ class RobustHubEnv(gym.Env):
         utilization_reward = 0.01 * (step_allocated / max(step_demand, 1.0))
         node_rewards += utilization_reward
 
+        # 3. 时序公平性惩罚 (即时反馈)
+        step_cov = step_allocated / max(step_demand, 1e-5)
+        if step_cov < 0.7:
+            node_rewards -= 2.0 * (0.7 - step_cov)
+
+        self.ep_step_covs.append(step_cov)
         self.current_t += 1
         terminated = self.current_t >= self.T
 
-        # 3. 终局大奖
+        # 4. 终局大奖：奖励最差步覆盖率，而非平均覆盖率
         if terminated:
             final_coverage = 1.0 - (self.ep_total_unmet / max(self.ep_total_demand, 1e-5))
-            jackpot_reward = 5.0 * (final_coverage ** 10)
+            min_step_cov = min(self.ep_step_covs)
+            # 平均覆盖 3.0 + 最差步覆盖 7.0 = 10.0 max，策略必须保地板
+            jackpot_reward = 3.0 * final_coverage + 7.0 * min_step_cov
             node_rewards += jackpot_reward
         else:
             final_coverage = 0.0
@@ -246,8 +256,9 @@ class RobustHubEnv(gym.Env):
             'transport_cost':  transport_cost,
             'unmet_penalty':   unmet_penalty,
             'step_cost':       transport_cost + unmet_penalty,
-            'step_demand':     step_demand, 
-            'step_unmet':      step_unmet,  
+            'step_demand':     step_demand,
+            'step_unmet':      step_unmet,
+            'step_coverage':   step_cov,
             'ep_coverage':     final_coverage if terminated else 0.0,
             'node_rewards':    node_rewards # 传出独立奖励数组
         }
