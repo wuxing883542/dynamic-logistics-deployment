@@ -40,6 +40,8 @@ def run_rl_temporal(cfg, env, ppo, predictor, device, scenarios):
         env.hub_capacities = np.full(env.K, cfg.Q, dtype=np.float32)
         env.ep_total_demand = 0.0
         env.ep_total_unmet = 0.0
+        env.ep_step_covs = []
+        env.ema_cov = None
         obs = env._get_obs()
 
         initial_orders = obs['current_orders'].copy()
@@ -58,6 +60,7 @@ def run_rl_temporal(cfg, env, ppo, predictor, device, scenarios):
             o_orders = torch.tensor(obs['current_orders'], dtype=torch.float32, device=device)
             o_mask = torch.tensor(obs['hub_mask'], dtype=torch.float32, device=device)
             o_cap = torch.tensor(obs['hub_capacities'], dtype=torch.float32, device=device)
+            o_time = torch.tensor(obs['time_ratio'], dtype=torch.float32, device=device)
             a_mask = torch.tensor(env.get_action_mask(), dtype=torch.bool, device=device)
 
             step_obs = {
@@ -66,6 +69,7 @@ def run_rl_temporal(cfg, env, ppo, predictor, device, scenarios):
                 'hub_mask': o_mask,
                 'hub_capacities': o_cap,
                 'predicted_orders': predicted,
+                'time_ratio': o_time,
             }
 
             with torch.no_grad():

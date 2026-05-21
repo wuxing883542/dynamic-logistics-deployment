@@ -28,4 +28,4 @@ class UAVHubConfig:
     tidal_sigma: float = 1.5       # 高斯峰的宽度（小时）
     
     # --- 5. 强化学习调度惩罚机制 ---
-    penalty_unmet: float = 100.0   # 拒单惩罚 (极高，逼迫 RL 在空间和容量上做极限统筹)
+    penalty_unmet: float = 100.0   # 拒单惩罚
