@@ -69,6 +69,7 @@ class RobustHubEnv(gym.Env):
             'hub_capacities':  spaces.Box(low=0.0, high=1.0, shape=(self.K,), dtype=np.float32),
             'time_ratio':      spaces.Box(low=0.0, high=1.0, shape=(1,), dtype=np.float32),
             'macro_pressure':  spaces.Box(low=0.0, high=10.0, shape=(1,), dtype=np.float32),
+            'static_target':   spaces.Box(low=0.0, high=1.0, shape=(1,), dtype=np.float32), # [执行方案B]
         })
 
     # ── 枢纽生成 ──────────────────────────────────────────────
@@ -123,6 +124,10 @@ class RobustHubEnv(gym.Env):
         self.ep_total_unmet = 0.0
         self.current_predicted_demand = 0.0
 
+        # 💡 [新增] 计算全天静态公平基准线（基于初始满载运力）
+        total_initial_cap = self.K * self.cfg.Q
+        self.day_static_target = min(1.0, total_initial_cap / max(self.day_total_expected_demand, 1.0))
+
         return self._get_obs(), {}
 
     # ── 观测构建 ──────────────────────────────────────────────
@@ -160,6 +165,7 @@ class RobustHubEnv(gym.Env):
             'hub_capacities':  self.hub_capacities.copy() / max(self.cfg.Q, 1.0),
             'time_ratio':      np.array([self.current_t / self.T], dtype=np.float32),
             'macro_pressure':  np.array([macro_pressure], dtype=np.float32),
+            'static_target':   np.array([getattr(self, 'day_static_target', 1.0)], dtype=np.float32), # [执行方案B]
         }
 
     # ── 单步推演 ──────────────────────────────────────────────
@@ -175,9 +181,9 @@ class RobustHubEnv(gym.Env):
         # 预估当前到午夜的剩余总需求 (利用先验分布/预测网络)
         rem_expected_demand = float(self.day_total_expected_demand - self.ep_total_demand)
         
-        # 【核心学术创新】动态最优消耗率 (Optimal Burn Rate)
-        # 如果运力充足，目标为 1.0；如果运力紧缺，目标平滑下降，指导网络主动削峰。
-        target_cov = 1.0 if rem_expected_demand <= 0 else min(1.0, pre_action_rem_cap / rem_expected_demand)
+        # ── 1. 获取全局静态时序公平目标 ──
+        # 💡 [修改] 废弃可被智能体操控的动态 target，使用全天死任务
+        target_cov = self.day_static_target
 
         # ── 2. 执行分配 (比例公平共享 Proportional Fair Share) ──
         step_allocated = 0.0
@@ -213,15 +219,24 @@ class RobustHubEnv(gym.Env):
         # ── 3. 更新累计统计 ──
         self.ep_total_demand += step_demand
         self.ep_total_unmet += (step_demand - step_allocated)
-        step_cov = step_allocated / max(step_demand, 1e-5)
+
+        # 💡 [修复假摔Bug] 如果该步需求为 0，覆盖率直接视为 100% (1.0)
+        if step_demand <= 0:
+            step_cov = 1.0
+        else:
+            step_cov = step_allocated / step_demand
 
         # ── 4. 目标追踪混合奖励 (Target-Tracking Hybrid Reward) ──
         node_rewards = np.zeros(self.N, dtype=np.float32)
 
-        # 宏观项：均方误差惩罚 (Mean Squared Error)
-        # 偏离目标覆盖率越多，惩罚呈指数(平方)放大，强制所有节点以全局时序公平为第一要务。
+        # 【恢复原始逻辑】抛弃多余的时间衰减，信任 target_cov 自身的闭环调节能力
+        base_c_fair = 10.0
+        # 💡 [二阶优化：非对称惩罚] 
+        # 如果当步覆盖率超过了静态及格线，说明在过度挥霍运力，加倍惩罚！
         fairness_error = abs(step_cov - target_cov)
-        global_fairness_reward = -(fairness_error ** 2) * 10.0
+
+        global_fairness_reward = -(fairness_error ** 2) * base_c_fair
+
 
         for i in active_nodes:
             hub_choice = action[i]
@@ -246,6 +261,21 @@ class RobustHubEnv(gym.Env):
         terminated = self.current_t >= self.T
         ep_cov = (1.0 - (self.ep_total_unmet / max(self.ep_total_demand, 1e-5))
                   if terminated else 0.0)
+
+        # 💡 [二阶优化：期末运力清算]
+        terminal_waste_penalty = 0.0
+        if terminated:
+            total_rem_cap = np.sum(self.hub_capacities)
+            total_initial_cap = self.K * self.cfg.Q
+            waste_ratio = total_rem_cap / max(total_initial_cap, 1.0)
+            # 如果全天结束运力没花完，给予终极重罚
+            terminal_waste_penalty = -waste_ratio * 50.0 
+            
+            # 把惩罚均摊给所有节点
+            if len(active_nodes) > 0:
+                node_rewards[active_nodes] += terminal_waste_penalty / len(active_nodes)
+
+
 
         info = {
             't':              self.current_t,

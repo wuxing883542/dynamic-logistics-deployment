@@ -42,7 +42,7 @@ class DynamicDispatchPPO(nn.Module):
         # 💡 [修复 Bug #4] 维度从 5 升到 6！
         # 接收 actor_input (hidden_dim + K) + 全局宏观特征 (6维: 总运力+总需求+活跃比+时间比+微观压力+宏观压力)
         self.critic_head = nn.Sequential(
-            nn.Linear(hidden_dim + self.K + 6, hidden_dim),
+            nn.Linear(hidden_dim + self.K + 7, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, 1)
         )
@@ -58,8 +58,9 @@ class DynamicDispatchPPO(nn.Module):
         hub_capacities = obs['hub_capacities']
         predicted_orders = obs['predicted_orders']
         time_ratio = obs.get('time_ratio', None)
-        # 💡 [修复 Bug #4] 获取环境传来的宏观压力
-        macro_pressure = obs.get('macro_pressure', None) 
+        # 💡 获取环境传来的宏观压力与静态公平目标
+        macro_pressure = obs.get('macro_pressure', None)
+        static_target  = obs.get('static_target', None)
 
         original_dim = node_features.dim()
         if original_dim == 2:
@@ -70,6 +71,7 @@ class DynamicDispatchPPO(nn.Module):
             predicted_orders = predicted_orders.unsqueeze(0)
             if time_ratio is not None: time_ratio = time_ratio.unsqueeze(0)
             if macro_pressure is not None: macro_pressure = macro_pressure.unsqueeze(0) # 💡 升维处理
+            if static_target is not None:  static_target  = static_target.unsqueeze(0)
             if action_mask is not None: action_mask = action_mask.unsqueeze(0)
 
         B, N_dim, _ = node_features.shape
@@ -105,9 +107,11 @@ class DynamicDispatchPPO(nn.Module):
         
         # 2. 外部环境算好的宏观压力 (预期剩余需求/剩余运力)
         m_pressure = macro_pressure if macro_pressure is not None else torch.zeros(B, 1, device=node_features.device)
+        # 3. 外部注入的全局静态公平目标 (day_static_target)
+        s_target = static_target if static_target is not None else torch.zeros(B, 1, device=node_features.device)
 
-        # 💡 [修复 Bug #4] 将原本的 5 维特征扩展为 6 维，完整囊括环境 Reward 的所有生成逻辑
-        global_context = torch.cat([total_rem_cap, total_demand, active_ratio, t_ratio, micro_pressure, m_pressure], dim=-1)  # (B, 6)
+        # 💡 全局上下文扩展为 7 维，完整囊括环境 Reward 的所有生成逻辑
+        global_context = torch.cat([total_rem_cap, total_demand, active_ratio, t_ratio, micro_pressure, m_pressure, s_target], dim=-1)
         global_context_expanded = global_context.unsqueeze(1).expand(-1, self.N, -1)
 
         critic_input = torch.cat([actor_input, global_context_expanded], dim=-1)

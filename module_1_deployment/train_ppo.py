@@ -6,7 +6,8 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
 from collections import deque
-
+from torch.optim.lr_scheduler import LinearLR
+import random  # 💡 [新增] 导入 random
 # 确保能找到项目根目录
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if BASE_DIR not in sys.path:
@@ -17,11 +18,22 @@ MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
 from config import UAVHubConfig
 from module_1_deployment.env_robust_hub import RobustHubEnv
 from module_1_deployment.model_gat_ppo import DynamicDispatchPPO, FutureDemandPredictor
-
+# ==========================================
+# 💡 [新增] 全局随机种子，确保实验 100% 可复现
+# ==========================================
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 # ==========================================
 # 🚀 主训练循环 (最终极版：IPPO + CTDE + 宏微观影子价格)
 # ==========================================
 def train():
+    set_seed(42)  # 💡 [新增] 第一时间锁定种子
     cfg = UAVHubConfig()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"🔥 使用设备: {device}")
@@ -35,26 +47,34 @@ def train():
     obs_sample, _ = env.reset()
     N = env.N
     
+     # 💡 超参数设置
+    total_episodes = 5000
+    gamma = 0.995           # 必须使用长视距衰减，让 Critic 能看向未来
+    gae_lambda = 0.95       
+    clip_epsilon = 0.2      
+    c_value = 0.5   
+
+    # 💡 [修改] 设定探索熵的起点和终点
+    c_entropy_start = 0.10  # 前期给高一点，鼓励多探索不同枢纽
+    c_entropy_end = 0.03    # 后期降下来，让动作分布变尖锐，锁定最优解
+    ppo_epochs = 4          
+
+    ORDER_SCALE = 100.0
+
+
     # 💡 初始化双脑网络
     predictor = FutureDemandPredictor(N=N, history_len=12, pred_len=4, hidden_dim=64).to(device)
     # 节点特征维度为 9 (包含百分位优先级等)
     ppo_policy = DynamicDispatchPPO(cfg, N=N, node_feature_dim=9, hidden_dim=128).to(device)
     
-    opt_pred = optim.Adam(predictor.parameters(), lr=1e-3)
+    opt_pred = optim.Adam(predictor.parameters(), lr=1e-3, weight_decay=1e-4)
     opt_ppo = optim.Adam(ppo_policy.parameters(), lr=3e-4, eps=1e-5)
-    
+    scheduler_ppo = LinearLR(opt_ppo, start_factor=1.0, end_factor=0.01, total_iters=total_episodes)
+
+    scheduler_pred = LinearLR(opt_pred, start_factor=1.0, end_factor=0.01, total_iters=total_episodes)
     writer = SummaryWriter(log_dir=os.path.join(log_dir, 'separated_inference_run'))
 
-    # 💡 超参数设置
-    total_episodes = 5000
-    gamma = 0.995           # 必须使用长视距衰减，让 Critic 能看向未来
-    gae_lambda = 0.95       
-    clip_epsilon = 0.2      
-    c_value = 0.5           
-    c_entropy = 0.05        # 保持稳定的低探索熵
-    ppo_epochs = 4          
-
-    ORDER_SCALE = 100.0
+   
 
     print("=================================================")
     print("🚀 开始分离式双脑训练 (预测辅助 + 影子价格 + IPPO)")
@@ -63,7 +83,13 @@ def train():
     recent_cov = deque(maxlen=20)
     recent_cost = deque(maxlen=20)
 
+    best_eval_score = 0.0
+
     for episode in range(1, total_episodes + 1):
+        # 💡 [新增] 线性衰减当前轮次的熵系数
+        current_c_entropy = c_entropy_start - (c_entropy_start - c_entropy_end) * (episode / total_episodes)
+        current_c_entropy = max(current_c_entropy, c_entropy_end) # 兜底机制
+        
         obs, _ = env.reset()
         done = False
 
@@ -114,6 +140,7 @@ def train():
                     'predicted_orders': predicted_orders,
                     'time_ratio': o_time,
                     'macro_pressure': o_macro, # 💡 喂给 PPO 状态字典
+                    'static_target': torch.tensor([env.day_static_target], dtype=torch.float32, device=device)
                 }
 
                 # 💡 [修复 Bug #3] 在调用 step 前，通过专用接口传入预测需求，保持 Gym 标准化
@@ -180,6 +207,7 @@ def train():
             'predicted_orders': torch.stack(rollout_data['obs_pred']),
             'time_ratio': torch.stack(rollout_data['obs_time']),
             'macro_pressure': torch.stack(rollout_data['obs_macro']), # 💡 喂给联合更新计算
+            'static_target': torch.full((len(rollout_data['obs_time']), 1), env.day_static_target, dtype=torch.float32, device=device),
         }
         b_actions = torch.stack(rollout_data['actions'])
         b_old_log_probs = torch.stack(rollout_data['log_probs']).detach() # (B, N)
@@ -218,7 +246,7 @@ def train():
             critic_loss = c_value * nn.MSELoss()(new_values, b_returns)
             entropy_loss = dist.entropy().mean()
             
-            ppo_loss = actor_loss + critic_loss - c_entropy * entropy_loss
+            ppo_loss = actor_loss + critic_loss - current_c_entropy * entropy_loss
 
             opt_ppo.zero_grad()
             ppo_loss.backward()
@@ -228,7 +256,8 @@ def train():
         # ── 10. 核心业务指标与 TensorBoard 写入 ──
         ep_cov = 1.0 - (ep_unmet / max(ep_demand, 1e-5))
         ep_cost = ep_penalty
-        
+        # ✅ 新增：获取跑完一整天后的系统总剩余运力
+        ep_rem_capacity = float(np.sum(env.hub_capacities))
         # 记录单集整城所有节点获得的总奖赏
         ep_reward = sum([r.sum().item() for r in rollout_data['rewards']])
 
@@ -239,7 +268,7 @@ def train():
         writer.add_scalar("1_Business/Coverage_Rate", ep_cov, episode)
         writer.add_scalar("1_Business/Total_Cost", ep_cost, episode)
         writer.add_scalar("1_Business/Penalty_Cost", ep_penalty, episode)
-        
+        writer.add_scalar("1_Business/Remaining_Capacity", ep_rem_capacity, episode)
         # 时序公平性的论文级核心指标：谷值覆盖率与全天方差
         writer.add_scalar("1_Business/StepCov_Min", min(step_covs), episode)
         writer.add_scalar("1_Business/StepCov_Std", np.std(step_covs), episode)
@@ -249,6 +278,11 @@ def train():
         writer.add_scalar("2_Loss/PPO_Critic", critic_loss.item(), episode)
         writer.add_scalar("2_Loss/PPO_Entropy", entropy_loss.item(), episode)
 
+        # 记录完 TensorBoard 后，让学习率衰减
+        scheduler_ppo.step()
+        scheduler_pred.step() # ✅ 新增：预测器学习率推进一步
+
+
         # ── 11. 控制台周期监控 ──
         if episode % 10 == 0:
             avg_cov = sum(recent_cov) / len(recent_cov)
@@ -256,6 +290,23 @@ def train():
             real_mse = pred_loss.item() * (ORDER_SCALE ** 2) 
             # 增加 StepCov_Min (谷值覆盖)，一眼盯紧晚高峰有没有崩盘！
             print(f"[Ep {episode:04d}] 奖赏: {ep_reward:7.1f} | 均覆盖: {avg_cov*100:5.2f}% | 谷值覆盖: {min(step_covs)*100:5.2f}% | 拒单: {ep_penalty:7.0f} | MSE: {real_mse:.1f}")
+
+        # ==========================================
+        # 💡 [新增] 巅峰权重保存逻辑 (Best Checkpoint)
+        # ==========================================
+        current_min_cov = min(step_covs)
+        # 使用当前轮次的 ep_cov 作为评估标准，比使用平滑后的 avg_cov 更敏锐
+        current_score = ep_cov + current_min_cov 
+        
+        # 必须同时突破两大门槛 (均值 > 80%, 谷值 > 45%)，且总分超越历史最佳
+        if ep_cov > 0.80 and current_min_cov > 0.45 and current_score > best_eval_score:
+            best_eval_score = current_score
+            print(f"🌟 [巅峰突破] Ep {episode:04d} 创下新高！均覆盖: {ep_cov*100:.2f}%, 谷值: {current_min_cov*100:.2f}% (综合得分: {current_score:.4f})")
+            
+            # 独立保存为 best 权重，防止被 500 轮的常规保存覆盖
+            torch.save(ppo_policy.state_dict(), os.path.join(model_dir, 'ppo_policy_best.pth'))
+            torch.save(predictor.state_dict(), os.path.join(model_dir, 'predictor_best.pth'))
+
 
         if episode % 500 == 0:
             torch.save(ppo_policy.state_dict(), os.path.join(model_dir, f'ppo_policy_ep{episode}.pth'))

@@ -1,6 +1,6 @@
 """
 分时覆盖率曲线对比: RL vs Greedy (论文终极版)
-包含：随机种子固化、小时制X轴、平滑曲线、误差置信带、量化指标柱状图
+包含：随机种子固化、小时制X轴、平滑曲线、误差置信带、量化指标柱状图、支持 Best 权重
 """
 
 import os
@@ -24,8 +24,9 @@ from module_1_deployment.model_gat_ppo import DynamicDispatchPPO, FutureDemandPr
 # ==========================================
 # ⚙️ 核心评测配置区
 # ==========================================
-DATASET_MODE = 'train' #eval或train
-TARGET_EPISODES = [1000, 1500, 2000, 2500] 
+DATASET_MODE = 'eval' # 💡 强烈建议画图时使用 eval 测试集看真实泛化能力
+# 💡 把目标从 EPISODES 改为 MODELS，加入 'best'
+TARGET_MODELS = [1000, 3000, 5000, 'best'] 
 ORDER_SCALE = 100.0
 
 # 💡 1. 增加全局随机种子，确保实验绝对可复现
@@ -49,6 +50,8 @@ def run_simulation(env, day_idx, models=None, device='cpu'):
     env.ep_total_demand = 0.0
     env.ep_total_unmet = 0.0
     env.current_predicted_demand = 0.0
+    total_initial_cap = env.K * env.cfg.Q
+    env.day_static_target = min(1.0, total_initial_cap / max(env.day_total_expected_demand, 1.0))
 
     obs = env._get_obs()
     done = False
@@ -95,10 +98,11 @@ def run_simulation(env, day_idx, models=None, device='cpu'):
                     'hub_capacities': torch.tensor(obs['hub_capacities'], dtype=torch.float32, device=device),
                     'predicted_orders': predicted_orders,
                     'time_ratio': torch.tensor(obs['time_ratio'], dtype=torch.float32, device=device),
-                    'macro_pressure': torch.tensor(obs['macro_pressure'], dtype=torch.float32, device=device)
+                    'macro_pressure': torch.tensor(obs['macro_pressure'], dtype=torch.float32, device=device),
+                    'static_target': torch.tensor([env.day_static_target], dtype=torch.float32, device=device)
                 }
                 a_mask = torch.tensor(env.get_action_mask(), dtype=torch.bool, device=device)
-                
+
                 action_tensor, _, _, _ = ppo_policy.get_action(step_obs, action_mask=a_mask, deterministic=False)
                 action = action_tensor.cpu().numpy()
 
@@ -118,7 +122,6 @@ def main():
     num_days = len(env.eval_scenarios) if DATASET_MODE == 'eval' else len(env.train_scenarios)
     print(f"🌍 开始进行时序公平性评估 | 数据集: {DATASET_MODE.upper()} | 总天数: {num_days}")
 
-    # 💡 修改：这里不再存均值，而是存所有的二维数组 (Days, 96)，用于计算标准差
     results_dict = {}
 
     print("🏃 正在运行 Greedy 基准测试...")
@@ -129,13 +132,21 @@ def main():
 
     model_dir = os.path.join(BASE_DIR, 'module_1_deployment', 'models')
     
-    for ep in TARGET_EPISODES:
-        print(f"🤖 正在评估 RL 策略 (Ep {ep})...")
-        predictor_path = os.path.join(model_dir, f'predictor_ep{ep}.pth')
-        ppo_path = os.path.join(model_dir, f'ppo_policy_ep{ep}.pth')
+    # 💡 遍历你设置的模型列表，兼容 best 权重
+    for model_id in TARGET_MODELS:
+        if model_id == 'best':
+            label = 'RL (Best)'
+            predictor_path = os.path.join(model_dir, 'predictor_best.pth')
+            ppo_path = os.path.join(model_dir, 'ppo_policy_best.pth')
+        else:
+            label = f'RL (Ep {model_id})'
+            predictor_path = os.path.join(model_dir, f'predictor_ep{model_id}.pth')
+            ppo_path = os.path.join(model_dir, f'ppo_policy_ep{model_id}.pth')
+            
+        print(f"🤖 正在评估 {label}...")
         
         if not os.path.exists(predictor_path) or not os.path.exists(ppo_path):
-            print(f"   ⚠️ 警告: 找不到 Ep {ep} 的权重，跳过。")
+            print(f"   ⚠️ 警告: 找不到 {label} 的权重，跳过。")
             continue
             
         predictor = FutureDemandPredictor(N=env.N).to(device)
@@ -148,7 +159,7 @@ def main():
         for day in range(num_days):
             rl_all_days.append(run_simulation(env, day, models=(predictor, ppo_policy), device=device))
             
-        results_dict[f'RL (Ep {ep})'] = np.array(rl_all_days)
+        results_dict[label] = np.array(rl_all_days)
 
     # ==========================================
     # 🎨 绘图：双子图布局 (左边曲线，右边量化柱状图)
@@ -180,15 +191,13 @@ def main():
         spl_mean = make_interp_spline(x_raw, mean_curve, k=3)
         y_mean_smooth = spl_mean(x_smooth)
         
-        
-
         # 绘制主曲线与误差带
         if label == 'Greedy':
             ax1.plot(x_smooth, y_mean_smooth, label=label, color='red', linestyle='--', linewidth=2.5, zorder=10)
-            
         else:
-            ax1.plot(x_smooth, y_mean_smooth, label=label, color=colors[idx], linewidth=2.0)
-            
+            # RL (Best) 用特殊颜色或更粗的线突出显示也可以
+            line_width = 2.5 if 'Best' in label else 2.0
+            ax1.plot(x_smooth, y_mean_smooth, label=label, color=colors[idx % len(colors)], linewidth=line_width)
 
     # ── 左图 (ax1) 格式设置 ──
     ax1.set_title(f"日内分时覆盖率与鲁棒性对比 (数据集: {DATASET_MODE.upper()})", fontsize=15)
