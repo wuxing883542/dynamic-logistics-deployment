@@ -69,6 +69,7 @@ class RobustHubEnv(gym.Env):
             'hub_capacities':  spaces.Box(low=0.0, high=1.0, shape=(self.K,), dtype=np.float32),
             'time_ratio':      spaces.Box(low=0.0, high=1.0, shape=(1,), dtype=np.float32),
             'macro_pressure':  spaces.Box(low=0.0, high=10.0, shape=(1,), dtype=np.float32),
+            'future_pressure': spaces.Box(low=0.0, high=10.0, shape=(1,), dtype=np.float32),
             'static_target':   spaces.Box(low=0.0, high=1.0, shape=(1,), dtype=np.float32), # [执行方案B]
         })
 
@@ -92,14 +93,31 @@ class RobustHubEnv(gym.Env):
         print("=" * 60)
         return fixed_hubs
 
-    # ── 动作掩码 ──────────────────────────────────────────────
+    # ── 动作掩码 (升级版：同地订单强制绑定) ──
     def _build_spatial_action_mask(self):
         mask = np.ones((self.N, self.K + 1), dtype=bool)
         for i in range(self.N):
+            is_hub_itself = False
+            my_hub_idx = -1
             for k in range(self.K):
-                if self.dist_matrix[i, self.hub_locations[k]] > self.max_radius:
-                    mask[i, k] = False
-            mask[i, self.K] = True
+                if i == self.hub_locations[k]:
+                    is_hub_itself = True
+                    my_hub_idx = k
+                    break
+
+            if is_hub_itself:
+                # 💡 如果我自己就是枢纽，只能派给自己，连拒单也不行
+                for k in range(self.K):
+                    if k != my_hub_idx:
+                        mask[i, k] = False
+                mask[i, self.K] = False 
+            else:
+                # 💡 普通节点，走距离判定逻辑
+                for k in range(self.K):
+                    if self.dist_matrix[i, self.hub_locations[k]] > self.max_radius:
+                        mask[i, k] = False
+                mask[i, self.K] = True 
+
         return mask
 
     def get_action_mask(self):
@@ -157,6 +175,12 @@ class RobustHubEnv(gym.Env):
         consumed_cap_ratio = 1.0 - (total_rem_cap / max(self.K * self.cfg.Q, 1.0))
         demand_arrival_ratio = self.ep_total_demand / max(self.day_total_expected_demand, 1.0)
         macro_pressure = max(0.0, consumed_cap_ratio - demand_arrival_ratio)
+        # 💡 2. 新增：前瞻预测压力（独立信号）
+        # ⚠️ 必须加上 max(total_rem_cap, 1.0) 防止晚高峰运力耗尽时除以 0 导致 nan！
+        future_pressure = float(self.current_predicted_demand) / max(total_rem_cap, 1.0)
+        # 稍微做个截断，保护神经网络不被极端值击穿
+        future_pressure = min(future_pressure, 5.0)
+
 
         return {
             'node_features':   node_f,
@@ -165,11 +189,14 @@ class RobustHubEnv(gym.Env):
             'hub_capacities':  self.hub_capacities.copy() / max(self.cfg.Q, 1.0),
             'time_ratio':      np.array([self.current_t / self.T], dtype=np.float32),
             'macro_pressure':  np.array([macro_pressure], dtype=np.float32),
+            'future_pressure': np.array([future_pressure], dtype=np.float32), # 💡 并列送入
             'static_target':   np.array([getattr(self, 'day_static_target', 1.0)], dtype=np.float32), # [执行方案B]
         }
 
     # ── 单步推演 ──────────────────────────────────────────────
-    def step(self, action):
+    # 原本是：def step(self, action):
+    # 改为（默认 True，保证训练和其他地方完全不变）：
+    def step(self, action, enable_local_free=True):
         action = np.asarray(action, dtype=np.int32).flatten()
         orders = self.current_scenario[self.current_t]
         active_nodes = np.where(orders > 0)[0]
@@ -185,19 +212,23 @@ class RobustHubEnv(gym.Env):
         # 💡 [修改] 废弃可被智能体操控的动态 target，使用全天死任务
         target_cov = self.day_static_target
 
-        # ── 2. 执行分配 (比例公平共享 Proportional Fair Share) ──
+        # ── 2. 执行分配 (双轨制：无人机 vs 电梯免单) ──
         step_allocated = 0.0
         allocated_per_node = np.zeros(self.N, dtype=np.float32)
 
         if len(active_nodes) > 0:
             hub_requests = {k: 0.0 for k in range(self.K)}
+            
+            # 第一轮：只统计异地订单对无人机的运力请求
             for i in active_nodes:
                 hub_choice = action[i]
                 if hub_choice != self.K:  
                     dist = self.dist_matrix[i, self.hub_locations[hub_choice]]
                     if dist <= self.max_radius:
-                        hub_requests[hub_choice] += orders[i]
+                        if i != self.hub_locations[hub_choice]: 
+                            hub_requests[hub_choice] += orders[i]
 
+            # 计算无人机运力挤兑比例
             hub_alloc_ratio = np.zeros(self.K, dtype=np.float32)
             for k in range(self.K):
                 if hub_requests[k] > 0:
@@ -206,16 +237,23 @@ class RobustHubEnv(gym.Env):
                     else:
                         hub_alloc_ratio[k] = self.hub_capacities[k] / hub_requests[k] 
 
+            # 第二轮：实际结算
             for i in active_nodes:
                 hub_choice = action[i]
                 if hub_choice != self.K:
                     dist = self.dist_matrix[i, self.hub_locations[hub_choice]]
                     if dist <= self.max_radius:
-                        alloc_vol = orders[i] * hub_alloc_ratio[hub_choice]
-                        allocated_per_node[i] = alloc_vol
-                        self.hub_capacities[hub_choice] -= alloc_vol
-                        step_allocated += alloc_vol
-
+                        if i == self.hub_locations[hub_choice] and enable_local_free:
+                            # 【同地免单】
+                            alloc_vol = float(orders[i])
+                            allocated_per_node[i] = alloc_vol
+                            step_allocated += alloc_vol
+                        else:
+                            # 【异地派送】扣除运力
+                            alloc_vol = orders[i] * hub_alloc_ratio[hub_choice]
+                            allocated_per_node[i] = alloc_vol
+                            self.hub_capacities[hub_choice] -= alloc_vol
+                            step_allocated += alloc_vol
         # ── 3. 更新累计统计 ──
         self.ep_total_demand += step_demand
         self.ep_total_unmet += (step_demand - step_allocated)
@@ -231,11 +269,14 @@ class RobustHubEnv(gym.Env):
 
         # 【恢复原始逻辑】抛弃多余的时间衰减，信任 target_cov 自身的闭环调节能力
         base_c_fair = 10.0
-        # 💡 [二阶优化：非对称惩罚] 
-        # 如果当步覆盖率超过了静态及格线，说明在过度挥霍运力，加倍惩罚！
-        fairness_error = abs(step_cov - target_cov)
-
-        global_fairness_reward = -(fairness_error ** 2) * base_c_fair
+        # 💡 [二阶优化：单边惩罚] 
+        # 只惩罚没达标的；如果因为同地免单导致超额完成，不仅不罚，反而给一点微弱奖励
+        if step_cov < target_cov:
+            fairness_error = target_cov - step_cov
+            global_fairness_reward = -(fairness_error ** 2) * base_c_fair
+        else:
+            # 超标了（覆盖率高于及格线），给一点正向激励，系数 2.0 可以根据需要微调
+            global_fairness_reward = (step_cov - target_cov) * 2.0
 
 
         for i in active_nodes:

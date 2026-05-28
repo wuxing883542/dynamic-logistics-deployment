@@ -99,6 +99,7 @@ def run_simulation(env, day_idx, models=None, device='cpu'):
                     'predicted_orders': predicted_orders,
                     'time_ratio': torch.tensor(obs['time_ratio'], dtype=torch.float32, device=device),
                     'macro_pressure': torch.tensor(obs['macro_pressure'], dtype=torch.float32, device=device),
+                    'future_pressure': torch.tensor(obs['future_pressure'], dtype=torch.float32, device=device),
                     'static_target': torch.tensor([env.day_static_target], dtype=torch.float32, device=device)
                 }
                 a_mask = torch.tensor(env.get_action_mask(), dtype=torch.bool, device=device)
@@ -106,7 +107,13 @@ def run_simulation(env, day_idx, models=None, device='cpu'):
                 action_tensor, _, _, _ = ppo_policy.get_action(step_obs, action_mask=a_mask, deterministic=False)
                 action = action_tensor.cpu().numpy()
 
-            next_obs, _, done, _, info = env.step(action)
+            # 💡 [修改这里] 把原本共用的一行，拆成给 Greedy 穿小鞋的两行
+            if models is None:
+                # Greedy：强行消耗运力 (残酷模式)
+                next_obs, _, done, _, info = env.step(action, enable_local_free=False)
+            else:
+                # RL：享受同地免单规则
+                next_obs, _, done, _, info = env.step(action, enable_local_free=True)
             step_coverages.append(info['step_coverage'])
             obs = next_obs
             

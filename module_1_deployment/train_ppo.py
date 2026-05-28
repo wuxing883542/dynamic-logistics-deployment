@@ -71,7 +71,7 @@ def train():
     opt_ppo = optim.Adam(ppo_policy.parameters(), lr=3e-4, eps=1e-5)
     scheduler_ppo = LinearLR(opt_ppo, start_factor=1.0, end_factor=0.01, total_iters=total_episodes)
 
-    scheduler_pred = LinearLR(opt_pred, start_factor=1.0, end_factor=0.01, total_iters=total_episodes)
+    
     writer = SummaryWriter(log_dir=os.path.join(log_dir, 'separated_inference_run'))
 
    
@@ -99,7 +99,7 @@ def train():
 
         rollout_data = {
             'obs_node': [], 'obs_orders': [], 'obs_mask': [], 'obs_cap': [], 'obs_pred': [],
-            'obs_time': [], 'obs_macro': [], # 💡 [修复 Bug #4] 新增宏观压力收集
+            'obs_time': [], 'obs_macro': [], 'obs_future': [],
             'actions': [], 'log_probs': [], 'values': [], 'rewards': [], 'action_masks': [],
             'hist_windows': [], 'actual_next_orders': []
         }
@@ -130,6 +130,7 @@ def train():
                 o_cap = torch.tensor(obs['hub_capacities'], dtype=torch.float32, device=device)
                 o_time = torch.tensor(obs['time_ratio'], dtype=torch.float32, device=device)
                 o_macro = torch.tensor(obs['macro_pressure'], dtype=torch.float32, device=device) # 💡 获取宏观压力
+                o_future = torch.tensor(obs['future_pressure'], dtype=torch.float32, device=device)
                 a_mask = torch.tensor(env.get_action_mask(), dtype=torch.bool, device=device)
 
                 step_obs = {
@@ -140,6 +141,7 @@ def train():
                     'predicted_orders': predicted_orders,
                     'time_ratio': o_time,
                     'macro_pressure': o_macro, # 💡 喂给 PPO 状态字典
+                    'future_pressure': o_future,
                     'static_target': torch.tensor([env.day_static_target], dtype=torch.float32, device=device)
                 }
 
@@ -160,6 +162,7 @@ def train():
                 rollout_data['obs_pred'].append(predicted_orders)
                 rollout_data['obs_time'].append(o_time)
                 rollout_data['obs_macro'].append(o_macro) # 💡 记录轨迹
+                rollout_data['obs_future'].append(o_future)
                 rollout_data['actions'].append(action)
                 rollout_data['log_probs'].append(log_prob)
                 rollout_data['values'].append(value)
@@ -207,6 +210,7 @@ def train():
             'predicted_orders': torch.stack(rollout_data['obs_pred']),
             'time_ratio': torch.stack(rollout_data['obs_time']),
             'macro_pressure': torch.stack(rollout_data['obs_macro']), # 💡 喂给联合更新计算
+            'future_pressure': torch.stack(rollout_data['obs_future']),
             'static_target': torch.full((len(rollout_data['obs_time']), 1), env.day_static_target, dtype=torch.float32, device=device),
         }
         b_actions = torch.stack(rollout_data['actions'])
@@ -280,8 +284,8 @@ def train():
 
         # 记录完 TensorBoard 后，让学习率衰减
         scheduler_ppo.step()
-        scheduler_pred.step() # ✅ 新增：预测器学习率推进一步
-
+       
+       
 
         # ── 11. 控制台周期监控 ──
         if episode % 10 == 0:
@@ -298,8 +302,8 @@ def train():
         # 使用当前轮次的 ep_cov 作为评估标准，比使用平滑后的 avg_cov 更敏锐
         current_score = ep_cov + current_min_cov 
         
-        # 必须同时突破两大门槛 (均值 > 80%, 谷值 > 45%)，且总分超越历史最佳
-        if ep_cov > 0.80 and current_min_cov > 0.45 and current_score > best_eval_score:
+        # 必须同时突破两大门槛 (均值 > 78%, 谷值 > 55%)，且总分超越历史最佳
+        if ep_cov > 0.78 and current_min_cov > 0.55 and current_score > best_eval_score:
             best_eval_score = current_score
             print(f"🌟 [巅峰突破] Ep {episode:04d} 创下新高！均覆盖: {ep_cov*100:.2f}%, 谷值: {current_min_cov*100:.2f}% (综合得分: {current_score:.4f})")
             
